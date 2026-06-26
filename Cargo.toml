@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/akurai-common", "crates/akurai-control", "crates/akurai-node", "crates/akurai-relay", "crates/akurai-admin", "crates/akurai-dns"]
+
+# AkurAI-VPN: a secure, one-touch mesh VPN overlay built pure-Rust with ZERO
+# runtime dependencies. The shipped binaries link NO third-party crates —
+# `std` only — the same principle as AkurAI-Framework. Dev/test tooling is
+# allowed only when it never ends up in a binary.
+#
+# UNRESOLVED DECISION (see docs/protocol.md): the plan mandates vetted crypto
+# crates (quinn/rustls/snow/ed25519) for the data plane, which conflicts with
+# the zero-dependency principle above. The transport/crypto modules are left as
+# clearly-marked stubs until Ólafur decides; NO cryptography is implemented here.
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/olibuijr/AkurAI-VPN"
+authors = ["Ólafur Búi Ólafsson"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,18 @@
+[package]
+name = "akurai-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN control plane: enrollment, IP allocation, peer map, ACL, audit, heartbeat (0.0.1 skeleton)."
+
+[[bin]]
+name = "akurai-control"
+path = "src/main.rs"
+
+# Only the workspace's own pure-std crate. No external runtime dependencies; the
+# HTTP listener is a stub because std has no production HTTP/TLS server and we
+# will not pull a crate for it until the transport decision is made.
+[dependencies]
+akurai-common = { path = "../akurai-common" }

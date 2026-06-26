@@ -1,0 +1,15 @@
+[package]
+name = "akurai-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN relay: ciphertext-only packet forwarding fallback (0.0.1 skeleton)."
+
+[[bin]]
+name = "akurai-relay"
+path = "src/main.rs"
+
+# Pure std, zero dependencies. The relay only forwards opaque ciphertext; it
+# never holds payload keys and links no crypto crate.

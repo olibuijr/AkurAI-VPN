@@ -1,0 +1,14 @@
+[package]
+name = "akurai-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure-std core types for AkurAI VPN: identities, overlay addressing, CIDR, policy, node descriptors. Zero dependencies."
+
+[lib]
+path = "src/lib.rs"
+
+# No [dependencies] — std only, by design. See AGENTS.md principle #1. The
+# transport/crypto layer is a stub here; no cryptographic crate is linked.

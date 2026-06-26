@@ -1,0 +1,16 @@
+[package]
+name = "akurai-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN internal MagicDNS: resolve *.oli.akurai to overlay IPs (0.0.1 skeleton)."
+
+[[bin]]
+name = "akurai-dns"
+path = "src/main.rs"
+
+# Workspace pure-std crate only; no external runtime dependency.
+[dependencies]
+akurai-common = { path = "../akurai-common" }

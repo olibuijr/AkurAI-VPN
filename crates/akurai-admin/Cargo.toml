@@ -1,0 +1,16 @@
+[package]
+name = "akurai-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN admin CLI: preauth, routes, ingress, devices, ACL management (0.0.1 skeleton)."
+
+[[bin]]
+name = "akurai-admin"
+path = "src/main.rs"
+
+# Workspace pure-std crate only; no external runtime dependency.
+[dependencies]
+akurai-common = { path = "../akurai-common" }

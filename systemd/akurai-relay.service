@@ -1,0 +1,26 @@
+[Unit]
+Description=AkurAI VPN relay (ciphertext-only fallback)
+Documentation=https://github.com/olibuijr/AkurAI-VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/akurai-relay serve
+Restart=on-failure
+RestartSec=2
+
+StateDirectory=akurai-vpn
+ConfigurationDirectory=akurai-vpn
+Environment=AKURAI_VPN_STATE=/var/lib/akurai-vpn
+Environment=AKURAI_VPN_CONFIG=/etc/akurai-vpn
+
+# The relay only forwards ciphertext; it needs no elevated privileges.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=AkurAI VPN control plane (vpn.olibuijr.com)
+Documentation=https://github.com/olibuijr/AkurAI-VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/akurai-control serve
+Restart=on-failure
+RestartSec=2
+
+# State and config (see docs/deployment-vpn.olibuijr.com.md)
+StateDirectory=akurai-vpn
+ConfigurationDirectory=akurai-vpn
+Environment=AKURAI_VPN_STATE=/var/lib/akurai-vpn
+Environment=AKURAI_VPN_CONFIG=/etc/akurai-vpn
+
+# Hardening (the control plane needs no special privileges)
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

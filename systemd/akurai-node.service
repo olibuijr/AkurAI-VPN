@@ -1,0 +1,27 @@
+[Unit]
+Description=AkurAI VPN node daemon (akurai0 overlay)
+Documentation=https://github.com/olibuijr/AkurAI-VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/akurai-node up
+ExecStop=/usr/local/bin/akurai-node down
+Restart=on-failure
+RestartSec=2
+
+ConfigurationDirectory=akurai-vpn
+StateDirectory=akurai-vpn
+Environment=AKURAI_VPN_STATE=/var/lib/akurai-vpn
+Environment=AKURAI_VPN_CONFIG=/etc/akurai-vpn
+
+# The node creates the akurai0 TUN device and edits the routing table, so it
+# needs network-admin capability and access to /dev/net/tun.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+DeviceAllow=/dev/net/tun rw
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
