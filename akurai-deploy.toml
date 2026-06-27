@@ -4,7 +4,7 @@
 
 name          = "akurai-vpn-control"          # systemd unit on the box
 domain        = "vpn.olibuijr.com"            # nginx vhost ("-" = internal/no public domain)
-port          = 8096                           # listen port (must agree with the _VMPORTS registry)
+port          = 8104                           # listen port (must agree with the _VMPORTS registry)
 repo          = "olibuijr/AkurAI-VPN"         # GitHub repo (used only to auto-create origin if missing)
 
 build         = "cargo build --release --target x86_64-unknown-linux-musl -p akurai-control"
