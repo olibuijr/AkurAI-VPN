@@ -1,0 +1,14 @@
+[package]
+name = "akurai-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency, from-scratch cryptographic core for AkurAI VPN: X25519, ChaCha20-Poly1305, BLAKE2s, HKDF. std only, no unsafe, verified against official RFC test vectors."
+
+[lib]
+path = "src/lib.rs"
+
+# No [dependencies] — std only, by design (AGENTS.md principle #1). Every
+# primitive is a published standard verified against its official test vectors.

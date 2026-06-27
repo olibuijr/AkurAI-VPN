@@ -1,16 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/akurai-common", "crates/akurai-control", "crates/akurai-node", "crates/akurai-relay", "crates/akurai-admin", "crates/akurai-dns"]
+members = ["crates/akurai-common", "crates/akurai-crypto", "crates/akurai-control", "crates/akurai-node", "crates/akurai-relay", "crates/akurai-admin", "crates/akurai-dns"]
 
 # AkurAI-VPN: a secure, one-touch mesh VPN overlay built pure-Rust with ZERO
 # runtime dependencies. The shipped binaries link NO third-party crates —
 # `std` only — the same principle as AkurAI-Framework. Dev/test tooling is
 # allowed only when it never ends up in a binary.
 #
-# UNRESOLVED DECISION (see docs/protocol.md): the plan mandates vetted crypto
-# crates (quinn/rustls/snow/ed25519) for the data plane, which conflicts with
-# the zero-dependency principle above. The transport/crypto modules are left as
-# clearly-marked stubs until Ólafur decides; NO cryptography is implemented here.
+# DECISION RESOLVED (2026-06-27, Ólafur): the data-plane cryptography is
+# implemented FROM SCRATCH in pure Rust — std only, no vetted crate
+# (quinn/rustls/snow/ed25519) — to preserve the zero-dependency identity. The
+# primitives live in `crates/akurai-crypto` and are each verified against their
+# official RFC test vectors. The hand-rolled-crypto risk is accepted deliberately.
 
 [workspace.package]
 version = "0.0.5"
