@@ -58,7 +58,7 @@ fn print_usage() {
     println!("    {NAME} <command>");
     println!();
     println!("COMMANDS:");
-    println!("    serve      Start the control-plane API (not implemented in 0.0.1)");
+    println!("    serve      Start the control-plane HTTP listener on CONTROL_PORT (default 8104)");
     println!("    version    Print version and exit");
     println!("    help       Show this help");
     println!();
