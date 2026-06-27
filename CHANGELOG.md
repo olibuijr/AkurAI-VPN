@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-06-27
+
+### Added
+- real JWT verification via IDP introspect endpoint
+
+
+
 ## [0.0.4] - 2026-06-27
 
 ### Added
