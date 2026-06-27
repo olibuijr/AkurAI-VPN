@@ -4,6 +4,22 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-06-27
+
+### Added
+- AkurAI IDP OIDC Authorization Code Flow login (`/login`, `/auth/callback`, `/auth/logout`)
+- In-memory session store with `akurai_session` cookie (HttpOnly, Secure, SameSite=Lax, 24h TTL)
+- VPN endpoint management: HTML dashboard (`/dashboard`), REST API (`GET/POST /api/endpoints`), delete (`POST /api/endpoints/:id/delete`, `DELETE /api/endpoints/:id`)
+- JSON endpoint persistence to `$AKURAI_DATA_DIR/vpn-endpoints.json` with atomic rename write
+- Auth state modules: `auth`, `vpn_endpoint`, `state` (zero external crates, std-only)
+- CSRF protection for OIDC callback via server-side pending-state nonce set
+- OIDC state nonce rotation (capped at 512 pending entries)
+
+### Notes
+- **OIDC env vars required** for login: `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URI` (and optionally `OIDC_ISSUER_URL`, defaults to `https://auth.olibuijr.com`)
+- **JWT signature not verified** — blocked on crypto crate decision (see Cargo.toml UNRESOLVED DECISION); token exchange itself authenticates the claims for the MVP
+- Token exchange uses `curl` subprocess to reach IDP HTTPS endpoint from std-only Rust
+
 ## [0.0.2] - 2026-06-27
 
 ### Added

@@ -9,11 +9,14 @@
 
 mod acl;
 mod audit;
+mod auth;
 mod enrollment;
 mod heartbeat;
 mod ipam;
 mod listener;
 mod peermap;
+mod state;
+mod vpn_endpoint;
 
 use std::process::ExitCode;
 
