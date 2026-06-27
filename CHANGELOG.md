@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-06-27
+
+### Added
+- add AkurAI IDP OIDC login, session management, and VPN endpoint CRUD (v0.0.3)
+
+
+
 ## [0.0.3] - 2026-06-27
 
 ### Added
