@@ -391,9 +391,9 @@ fn handle_callback(req: &Request, state: &SharedState) -> Response {
         Some(t) => t,
         None => return Response::error_html("No id_token in IDP response"),
     };
-    let user = match auth::decode_jwt_claims(&id_token) {
-        Some(u) => u,
-        None => return Response::error_html("Failed to decode JWT claims"),
+    let user = match auth::verify_id_token(&config, &id_token) {
+        Ok(u) => u,
+        Err(e) => return Response::error_html(&format!("Token verification failed: {e}")),
     };
 
     // Create session

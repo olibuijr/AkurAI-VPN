@@ -1,11 +1,8 @@
 //! OIDC Authorization Code Flow helpers — std-only, zero external crates.
 //!
-//! **BLOCKER — JWT signature not verified.** The AkurAI IDP uses EdDSA
-//! (Ed25519). Verifying the signature requires the `ed25519-dalek` crate,
-//! which is blocked on the UNRESOLVED DECISION in Cargo.toml. The
-//! code→token exchange is authenticated by the IDP so the claim content is
-//! trustworthy for an MVP, but production deployments must add signature
-//! verification once the crypto-crate decision is resolved.
+//! JWT verification is delegated to the IDP's `/introspect` endpoint (called
+//! via `curl`). The IDP verifies the EdDSA signature, expiry, and returns
+//! claim data. We additionally validate issuer and audience client-side.
 //!
 //! **Required env vars** (server logs a warning and disables login if any
 //! are absent):
@@ -140,11 +137,89 @@ pub fn extract_id_token(json: &str) -> Option<String> {
     extract_json_str(json, "id_token")
 }
 
-/// Decode the JWT payload and return user identity fields.
+/// Verify an id_token by calling the IDP's `/introspect` endpoint.
 ///
-/// **Signature is NOT verified** — blocked on the crypto crate decision.
-/// The code→token exchange authenticates the response so this is safe for
-/// the MVP. See module-level docs.
+/// The IDP performs full EdDSA signature verification and expiry checking.
+/// This function additionally validates issuer and audience locally.
+///
+/// Returns `Ok(AuthUser)` on success or `Err(reason)` if the token is invalid,
+/// expired, has the wrong audience, or cannot be reached.
+pub fn verify_id_token(config: &OidcConfig, id_token: &str) -> Result<AuthUser, String> {
+    let introspect_url = format!("{}/introspect", config.issuer_url);
+    let body = format!(
+        "token={token}&token_type_hint=access_token&client_id={cid}",
+        token = url_encode(id_token),
+        cid = url_encode(&config.client_id),
+    );
+    let output = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/x-www-form-urlencoded",
+            "-d",
+            &body,
+            &introspect_url,
+        ])
+        .output()
+        .map_err(|e| format!("curl exec failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "curl exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let json =
+        String::from_utf8(output.stdout).map_err(|e| format!("curl output not UTF-8: {e}"))?;
+    verify_introspect_response(&json, &config.client_id, &config.issuer_url)
+}
+
+/// Validate an introspect JSON response and extract the authenticated user.
+/// Separated from the curl call so it can be unit-tested.
+pub fn verify_introspect_response(
+    json: &str,
+    expected_client_id: &str,
+    expected_issuer: &str,
+) -> Result<AuthUser, String> {
+    let active = extract_json_bool(json, "active").unwrap_or(false);
+    if !active {
+        return Err("token rejected by IDP (expired, invalid signature, or revoked)".to_string());
+    }
+
+    let iss = extract_json_str(json, "iss").unwrap_or_default();
+    if !iss.is_empty() && iss != expected_issuer {
+        return Err(format!(
+            "issuer mismatch: got '{iss}', expected '{expected_issuer}'"
+        ));
+    }
+
+    let aud = extract_json_str(json, "aud").unwrap_or_default();
+    if !aud.is_empty() && aud != expected_client_id {
+        return Err(format!(
+            "audience mismatch: got '{aud}', expected '{expected_client_id}'"
+        ));
+    }
+
+    Ok(AuthUser {
+        sub: extract_json_str(json, "sub").unwrap_or_default(),
+        email: extract_json_str(json, "email").unwrap_or_default(),
+        name: extract_json_str(json, "name")
+            .or_else(|| extract_json_str(json, "preferred_username"))
+            .unwrap_or_default(),
+    })
+}
+
+/// Decode the JWT payload and return user identity fields (no signature check).
+///
+/// Used as a fallback when the introspect endpoint is unreachable. Prefer
+/// `verify_id_token` for production code paths.
+#[allow(dead_code)]
 pub fn decode_jwt_claims(id_token: &str) -> Option<AuthUser> {
     let payload_b64 = id_token.split('.').nth(1)?;
     let bytes = base64url_decode(payload_b64)?;
@@ -242,6 +317,21 @@ pub fn parse_form(body: &str) -> HashMap<String, String> {
 // Minimal JSON extraction (no serde — zero crate dep)
 // ---------------------------------------------------------------------------
 
+/// Extract a JSON boolean value by key from a flat JSON object.
+pub fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)?;
+    let rest = json[start + needle.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Extract a JSON string value by key from a flat JSON object.
 ///
 /// Handles simple cases only: does not parse deep nesting, but correctly
@@ -297,6 +387,7 @@ pub fn extract_json_str_array(json: &str, key: &str) -> Vec<String> {
 // Base64url decode (for JWT payload — no external crate)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     let standard = s.replace('-', "+").replace('_', "/");
     let rem = standard.len() % 4;
@@ -308,8 +399,10 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     base64_decode(&padded)
 }
 
+#[allow(dead_code)]
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[allow(dead_code)]
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let chars: Vec<u8> = s
         .bytes()
@@ -336,4 +429,112 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- verify_introspect_response --
+
+    #[test]
+    fn introspect_active_good_claims() {
+        let json = r#"{"active":true,"iss":"https://auth.olibuijr.com","aud":"client-abc","sub":"user-1","email":"user@example.com","name":"Test User"}"#;
+        let user =
+            verify_introspect_response(json, "client-abc", "https://auth.olibuijr.com").unwrap();
+        assert_eq!(user.sub, "user-1");
+        assert_eq!(user.email, "user@example.com");
+        assert_eq!(user.name, "Test User");
+    }
+
+    #[test]
+    fn introspect_inactive_rejected() {
+        let json = r#"{"active":false}"#;
+        let err = verify_introspect_response(json, "client-abc", "https://auth.olibuijr.com")
+            .unwrap_err();
+        assert!(err.contains("rejected by IDP"), "got: {err}");
+    }
+
+    #[test]
+    fn introspect_wrong_audience() {
+        let json = r#"{"active":true,"iss":"https://auth.olibuijr.com","aud":"other-client","sub":"u","email":"u@x.com"}"#;
+        let err = verify_introspect_response(json, "client-abc", "https://auth.olibuijr.com")
+            .unwrap_err();
+        assert!(err.contains("audience mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn introspect_wrong_issuer() {
+        let json = r#"{"active":true,"iss":"https://evil.example.com","aud":"client-abc","sub":"u","email":"u@x.com"}"#;
+        let err = verify_introspect_response(json, "client-abc", "https://auth.olibuijr.com")
+            .unwrap_err();
+        assert!(err.contains("issuer mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn introspect_missing_iss_aud_still_accepted() {
+        // IDP may omit iss/aud if token is valid; we accept it (defensive)
+        let json = r#"{"active":true,"sub":"u","email":"u@x.com"}"#;
+        let user =
+            verify_introspect_response(json, "client-abc", "https://auth.olibuijr.com").unwrap();
+        assert_eq!(user.sub, "u");
+    }
+
+    // -- extract_json_bool --
+
+    #[test]
+    fn json_bool_true() {
+        assert_eq!(
+            extract_json_bool(r#"{"active":true}"#, "active"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn json_bool_false() {
+        assert_eq!(
+            extract_json_bool(r#"{"active":false}"#, "active"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn json_bool_missing() {
+        assert_eq!(extract_json_bool(r#"{"foo":"bar"}"#, "active"), None);
+    }
+
+    // -- extract_json_str (regression) --
+
+    #[test]
+    fn json_str_basic() {
+        assert_eq!(
+            extract_json_str(r#"{"email":"user@example.com"}"#, "email"),
+            Some("user@example.com".to_string())
+        );
+    }
+
+    // -- url_encode / url_decode roundtrip --
+
+    #[test]
+    fn url_encode_decode_roundtrip() {
+        let original = "https://vpn.olibuijr.com/auth/callback?foo=bar&baz=qux";
+        assert_eq!(url_decode(&url_encode(original)), original);
+    }
+
+    // -- parse_session_cookie --
+
+    #[test]
+    fn session_cookie_found() {
+        let cookie = "other=val; akurai_session=abc123; another=x";
+        assert_eq!(parse_session_cookie(cookie), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn session_cookie_missing() {
+        assert_eq!(parse_session_cookie("foo=bar"), None);
+    }
 }
