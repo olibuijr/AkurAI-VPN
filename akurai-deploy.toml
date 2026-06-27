@@ -9,7 +9,8 @@ repo          = "olibuijr/AkurAI-VPN"         # GitHub repo (used only to auto-c
 
 build         = "cargo build --release --target x86_64-unknown-linux-musl -p akurai-control"
 artifact      = "target/x86_64-unknown-linux-musl/release/akurai-control"
-# appdir      =                                # (none — control plane ships no frontend payload)
+appdir        = "systemd"                      # create the release engine working dir; no frontend payload
+exec_start    = "{bin} serve"                  # override the Framework-style default serve command
 
 version_file  = "VERSION"                      # source of truth
 cargo_version = "workspace"                    # workspace | package | none — keeps Cargo.toml in lockstep
