@@ -278,7 +278,7 @@ fn route(req: &Request, state: &SharedState) -> Response {
 
     // Un-authenticated routes
     match (req.method, path) {
-        (Method::Get, "/" | "/health" | "/healthz") => return handle_status(state),
+        (Method::Get, "/" | "/health" | "/healthz" | "/api/health") => return handle_status(state),
         (Method::Get, "/login") => return handle_login(state),
         (Method::Get, "/auth/callback") => return handle_callback(req, state),
         (Method::Get, "/auth/logout") => return handle_logout(req, state),
@@ -333,7 +333,7 @@ fn route(req: &Request, state: &SharedState) -> Response {
 fn handle_status(state: &SharedState) -> Response {
     let count = state.lock().ok().map(|s| s.endpoints.len()).unwrap_or(0);
     Response::ok_json(format!(
-        "{{\"status\":\"ok\",\"service\":\"{NAME}\",\"version\":\"{VERSION}\",\"endpoints\":{count}}}\n"
+        "{{\"app\":\"{NAME}\",\"status\":\"ok\",\"version\":\"{VERSION}\",\"endpoints\":{count}}}\n"
     ))
 }
 

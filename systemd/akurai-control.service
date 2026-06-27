@@ -16,6 +16,12 @@ ConfigurationDirectory=akurai-vpn
 Environment=AKURAI_VPN_STATE=/var/lib/akurai-vpn
 Environment=AKURAI_VPN_CONFIG=/etc/akurai-vpn
 
+# OIDC — see passvault entry "AkurAI-VPN OIDC client"
+Environment=OIDC_CLIENT_ID=ed2c64e6db2797da007adddf80a13d04
+Environment=OIDC_CLIENT_SECRET=abc9e4e4f0d4c071c1c5d2cb3708b31b19026801a11f77fec49a2301e6dd0a6965e8e96e4b0c35cb
+Environment=OIDC_REDIRECT_URI=https://vpn.olibuijr.com/auth/callback
+Environment=OIDC_ISSUER_URL=https://auth.olibuijr.com
+
 # Hardening (the control plane needs no special privileges)
 DynamicUser=yes
 NoNewPrivileges=yes

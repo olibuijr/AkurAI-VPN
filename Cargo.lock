@@ -4,36 +4,36 @@ version = 4
 
 [[package]]
 name = "akurai-admin"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-common"
-version = "0.0.4"
+version = "0.0.5"
 
 [[package]]
 name = "akurai-control"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-dns"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-node"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-relay"
-version = "0.0.4"
+version = "0.0.5"
