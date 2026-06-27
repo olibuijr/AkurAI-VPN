@@ -1,0 +1,22 @@
+# akurai-deploy.toml — declarative release/deploy config for `akurai-ec2 release`.
+# Replaces the imperative logic that used to live in deploy.sh. The release engine
+# reads this; `./deploy.sh` is now a thin shim into it.
+
+name          = "akurai-vpn-control"          # systemd unit on the box
+domain        = "vpn.olibuijr.com"            # nginx vhost ("-" = internal/no public domain)
+port          = 8096                           # listen port (must agree with the _VMPORTS registry)
+repo          = "olibuijr/AkurAI-VPN"         # GitHub repo (used only to auto-create origin if missing)
+
+build         = "cargo build --release --target x86_64-unknown-linux-musl -p akurai-control"
+artifact      = "target/x86_64-unknown-linux-musl/release/akurai-control"
+# appdir      =                                # (none — control plane ships no frontend payload)
+
+version_file  = "VERSION"                      # source of truth
+cargo_version = "workspace"                    # workspace | package | none — keeps Cargo.toml in lockstep
+
+changelog      = "CHANGELOG.md"
+changelog_mode = "hybrid"                      # hybrid | auto | manual
+
+gate_fmt    = true
+gate_clippy = true
+gate_test   = true
