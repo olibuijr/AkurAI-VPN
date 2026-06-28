@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/akurai-common", "crates/akurai-crypto", "crates/akurai-control", "crates/akurai-node", "crates/akurai-relay", "crates/akurai-admin", "crates/akurai-dns"]
+members = ["crates/akurai-common", "crates/akurai-crypto", "crates/akurai-transport", "crates/akurai-control", "crates/akurai-node", "crates/akurai-relay", "crates/akurai-admin", "crates/akurai-dns"]
 
 # AkurAI-VPN: a secure, one-touch mesh VPN overlay built pure-Rust with ZERO
 # runtime dependencies. The shipped binaries link NO third-party crates —

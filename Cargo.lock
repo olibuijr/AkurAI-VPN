@@ -41,3 +41,10 @@ dependencies = [
 [[package]]
 name = "akurai-relay"
 version = "0.0.5"
+
+[[package]]
+name = "akurai-transport"
+version = "0.0.5"
+dependencies = [
+ "akurai-crypto",
+]

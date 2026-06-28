@@ -1,0 +1,16 @@
+[package]
+name = "akurai-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN secure channel: Noise_IK handshake + authenticated data-packet session with replay protection, built on the zero-dep akurai-crypto primitives. No external dependencies."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Internal path-dep only — akurai-crypto is std-only, so the binary still links
+# NO third-party crate. No other dependencies, by design.
+akurai-crypto = { path = "../akurai-crypto" }
