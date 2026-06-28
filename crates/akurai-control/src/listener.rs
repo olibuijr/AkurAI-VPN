@@ -445,18 +445,25 @@ fn handle_dashboard(req: &Request, state: &SharedState) -> Response {
     let endpoints = state
         .lock()
         .ok()
-        .map(|s| s.endpoints.clone())
+        .map(|s| {
+            s.endpoints
+                .iter()
+                .filter(|e| e.added_by == user.user.email)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     Response::ok_html(render_dashboard(&user.user, &user.csrf_token, &endpoints))
 }
 
-fn handle_list_endpoints(_user: &AuthSession, state: &SharedState) -> Response {
+fn handle_list_endpoints(session: &AuthSession, state: &SharedState) -> Response {
     let json = state
         .lock()
         .ok()
         .map(|s| {
             s.endpoints
                 .iter()
+                .filter(|e| e.added_by == session.user.email)
                 .map(|e| e.to_json())
                 .collect::<Vec<_>>()
                 .join(",")
@@ -569,7 +576,8 @@ fn delete_endpoint(
         Err(_) => return Response::error_html("Internal state lock error"),
     };
     let before = st.endpoints.len();
-    st.endpoints.retain(|e| e.id != id);
+    st.endpoints
+        .retain(|e| !(e.id == id && e.added_by == session.user.email));
     if st.endpoints.len() == before {
         return Response::not_found();
     }
@@ -825,5 +833,71 @@ mod tests {
         };
         let html = render_dashboard(&user, "csrf-value", &[]);
         assert!(html.contains(r#"name="csrf_token" value="csrf-value""#));
+    }
+
+    #[test]
+    fn endpoint_list_is_scoped_to_authenticated_user() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
+                id: "mine".to_string(),
+                name: "midget".to_string(),
+                public_key: "pk1".to_string(),
+                endpoint_addr: String::new(),
+                allowed_ips: Vec::new(),
+                added_by: "user@example.com".to_string(),
+                added_at: 1,
+            });
+            st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
+                id: "other".to_string(),
+                name: "other-host".to_string(),
+                public_key: "pk2".to_string(),
+                endpoint_addr: String::new(),
+                allowed_ips: Vec::new(),
+                added_by: "other@example.com".to_string(),
+                added_at: 1,
+            });
+        }
+        let session = AuthSession {
+            user: AuthUser {
+                sub: "sub".to_string(),
+                email: "user@example.com".to_string(),
+                name: "User".to_string(),
+            },
+            csrf_token: "csrf".to_string(),
+        };
+        let response = handle_list_endpoints(&session, &state);
+        assert!(response.body.contains("mine"));
+        assert!(!response.body.contains("other"));
+    }
+
+    #[test]
+    fn delete_endpoint_cannot_remove_another_users_node() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
+                id: "other".to_string(),
+                name: "other-host".to_string(),
+                public_key: "pk2".to_string(),
+                endpoint_addr: String::new(),
+                allowed_ips: Vec::new(),
+                added_by: "other@example.com".to_string(),
+                added_at: 1,
+            });
+        }
+        let session = AuthSession {
+            user: AuthUser {
+                sub: "sub".to_string(),
+                email: "user@example.com".to_string(),
+                name: "User".to_string(),
+            },
+            csrf_token: "csrf".to_string(),
+        };
+        let req = request(&[], "csrf_token=csrf");
+        let response = delete_endpoint("other", &session, &req, &state);
+        assert_eq!(response.status, "404 Not Found");
+        assert_eq!(state.lock().unwrap().endpoints.len(), 1);
     }
 }

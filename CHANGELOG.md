@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-06-28
+
+- Require per-user VPN node networks
+
+
 ## [0.0.7] - 2026-06-28
 
 - Add host-only node install defaults

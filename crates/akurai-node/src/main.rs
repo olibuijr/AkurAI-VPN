@@ -64,7 +64,9 @@ fn install(args: &[String]) -> Result<(), NodeError> {
 
     let current_exe = std::env::current_exe()?;
     let installed_exe = dirs.bin.join(NAME);
-    fs::copy(&current_exe, &installed_exe)?;
+    if current_exe.canonicalize().ok() != installed_exe.canonicalize().ok() {
+        fs::copy(&current_exe, &installed_exe)?;
+    }
 
     if !dirs.config_file.exists() {
         let hostname = std::env::var("HOSTNAME")
