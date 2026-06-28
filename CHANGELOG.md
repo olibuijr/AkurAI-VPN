@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-06-28
+
+### Added
+- per-node overlay IP allocation, backfill, and surfacing
+
+### Changed
+- sync lockfile for v0.0.8
+
+
+
 ## [0.0.8] - 2026-06-28
 
 - Require per-user VPN node networks
