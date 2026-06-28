@@ -97,11 +97,15 @@ fn up(args: &[String]) -> Result<(), NodeError> {
     if let Some(key) = auth_key(args) {
         write_file(&dirs.auth_key_file, key)?;
     }
+    if let Some(ip) = arg_value(args, "--overlay-ip") {
+        write_file(&dirs.overlay_file, ip)?;
+    }
     tun::host_only_notice(akurai_common::TUN_INTERFACE);
     peermap::host_only_notice();
     write_state(&dirs, "up")?;
     println!("{NAME}: host-only membership is up");
     println!("  home    : {}", dirs.home.display());
+    println!("  overlay : {}", read_overlay(&dirs));
     println!("  routing : disabled");
     Ok(())
 }
@@ -126,9 +130,19 @@ fn status(args: &[String]) -> Result<(), NodeError> {
     println!("{NAME} {VERSION}");
     println!("  home    : {}", dirs.home.display());
     println!("  mode    : host-only");
+    println!("  overlay : {}", read_overlay(&dirs));
     println!("  routing : disabled");
     print!("{state}");
     Ok(())
+}
+
+/// Read the locally-recorded overlay IP, or a placeholder when unassigned.
+fn read_overlay(dirs: &NodeDirs) -> String {
+    fs::read_to_string(&dirs.overlay_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unassigned".to_string())
 }
 
 /// Extract `--auth-key <value>` from the argument list, if present.
@@ -150,7 +164,8 @@ fn print_usage() {
     println!();
     println!("COMMANDS:");
     println!("    install                 Install into ~/.akurai-vpn by default");
-    println!("    up [--auth-key <key>]   Enable host-only membership (no routing)");
+    println!("    up [--auth-key <key>] [--overlay-ip <ip>]");
+    println!("                            Enable host-only membership (no routing)");
     println!("    down                    Disable host-only membership");
     println!("    status                  Show local node status");
     println!("    path                    Print the resolved AkurAI-VPN home");
@@ -194,6 +209,7 @@ struct NodeDirs {
     config_file: PathBuf,
     state_file: PathBuf,
     auth_key_file: PathBuf,
+    overlay_file: PathBuf,
 }
 
 impl NodeDirs {
@@ -204,6 +220,7 @@ impl NodeDirs {
         let config_file = config.join("node.conf");
         let state_file = state.join("node.state");
         let auth_key_file = config.join("auth.key");
+        let overlay_file = state.join("overlay.ip");
         Self {
             home,
             bin,
@@ -212,6 +229,7 @@ impl NodeDirs {
             config_file,
             state_file,
             auth_key_file,
+            overlay_file,
         }
     }
 
@@ -266,5 +284,29 @@ mod tests {
             "secret".to_string(),
         ];
         assert_eq!(auth_key(&args), Some("secret"));
+    }
+
+    #[test]
+    fn overlay_ip_is_parsed_independently_of_other_flags() {
+        let args = vec![
+            "--home".to_string(),
+            "/tmp/akurai-vpn-test".to_string(),
+            "--auth-key".to_string(),
+            "secret".to_string(),
+            "--overlay-ip".to_string(),
+            "100.88.0.2".to_string(),
+        ];
+        assert_eq!(arg_value(&args, "--overlay-ip"), Some("100.88.0.2"));
+        // Order-independence: overlay flag does not disturb auth-key parsing.
+        assert_eq!(auth_key(&args), Some("secret"));
+    }
+
+    #[test]
+    fn overlay_file_lives_under_state() {
+        let dirs = NodeDirs::new(PathBuf::from("/tmp/akurai-vpn-test"));
+        assert_eq!(
+            dirs.overlay_file,
+            PathBuf::from("/tmp/akurai-vpn-test/state/overlay.ip")
+        );
     }
 }

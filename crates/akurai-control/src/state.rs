@@ -23,9 +23,18 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        // Backfill: assign an overlay IP to any node enrolled before allocation
+        // existed, then persist so the on-disk record surfaces the address.
+        let mut endpoints = crate::vpn_endpoint::load();
+        let assigned = crate::ipam::assign_missing(&mut endpoints);
+        if assigned > 0 {
+            if let Err(e) = crate::vpn_endpoint::save(&endpoints) {
+                eprintln!("akurai-control: failed to persist backfilled overlay IPs: {e}");
+            }
+        }
         Self {
             sessions: SessionStore::new(),
-            endpoints: crate::vpn_endpoint::load(),
+            endpoints,
             pending_states: HashSet::new(),
             csrf_tokens: HashMap::new(),
         }

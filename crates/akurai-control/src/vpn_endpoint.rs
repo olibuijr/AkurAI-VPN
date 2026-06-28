@@ -31,14 +31,16 @@ impl VpnEndpoint {
             .map(|ip| format!("\"{}\"", json_esc(ip)))
             .collect::<Vec<_>>()
             .join(",");
+        let overlay_ipv4 = crate::ipam::overlay_addr_string(&self.allowed_ips).unwrap_or_default();
         format!(
             "{{\"id\":\"{}\",\"name\":\"{}\",\"public_key\":\"{}\",\
-             \"endpoint\":\"{}\",\"allowed_ips\":[{}],\
+             \"endpoint\":\"{}\",\"overlay_ipv4\":\"{}\",\"allowed_ips\":[{}],\
              \"added_by\":\"{}\",\"added_at\":{}}}",
             json_esc(&self.id),
             json_esc(&self.name),
             json_esc(&self.public_key),
             json_esc(&self.endpoint_addr),
+            json_esc(&overlay_ipv4),
             ips,
             json_esc(&self.added_by),
             self.added_at,

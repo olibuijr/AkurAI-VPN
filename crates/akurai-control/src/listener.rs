@@ -164,7 +164,6 @@ pub fn serve() -> Result<(), String> {
     eprintln!("{NAME} {VERSION}: control-plane subsystems:");
     for line in [
         enrollment::status(),
-        ipam::status(),
         peermap::status(),
         acl::status(),
         audit::status(),
@@ -182,6 +181,7 @@ pub fn serve() -> Result<(), String> {
     {
         let st = state.lock().map_err(|e| e.to_string())?;
         eprintln!("  - endpoints: {} loaded from disk", st.endpoints.len());
+        eprintln!("  - {}", ipam::status(&st.endpoints));
     }
 
     let port: u16 = std::env::var("CONTROL_PORT")
@@ -534,11 +534,38 @@ fn do_add_endpoint(
     name: String,
     public_key: String,
     endpoint_addr: String,
-    allowed_ips: Vec<String>,
+    mut allowed_ips: Vec<String>,
     user: &AuthUser,
     state: &SharedState,
 ) -> Response {
     use crate::vpn_endpoint::{now_secs, random_id, save, VpnEndpoint};
+
+    let mut st = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+
+    // Assign a stable, unique overlay IPv4 from 100.88.0.0/16. Done under the
+    // state lock so concurrent enrollments cannot race onto the same index.
+    // Normalize to exactly ONE overlay address per node: strip every overlay
+    // entry the caller supplied (so no stray index can be smuggled in), then
+    // re-insert a single canonical /32 — the supplied index if it is a valid,
+    // free node index, else the lowest free address. Non-overlay CIDRs are
+    // preserved. Pure bookkeeping — no route, TUN device, or host-network change.
+    let used = crate::ipam::used_indices(&st.endpoints);
+    let supplied = crate::ipam::overlay_index_of(&allowed_ips);
+    allowed_ips.retain(|e| crate::ipam::overlay_index_of(std::slice::from_ref(e)).is_none());
+    match crate::ipam::choose_for_enrollment(supplied, &used) {
+        Some(ip) => allowed_ips.insert(0, crate::ipam::overlay_cidr(ip)),
+        None => {
+            // The /16 is exhausted. The node can still join host-only without an
+            // overlay address, but make the condition loud — silent exhaustion
+            // would otherwise surface only as a dashboard "—".
+            eprintln!(
+                "{NAME}: overlay pool 100.88.0.0/16 exhausted — registering node without an overlay IP"
+            );
+        }
+    }
 
     let ep = VpnEndpoint {
         id: random_id(),
@@ -550,16 +577,26 @@ fn do_add_endpoint(
         added_at: now_secs(),
     };
     let id = ep.id.clone();
+    let overlay_ipv4 = crate::ipam::overlay_addr_string(&ep.allowed_ips).unwrap_or_default();
 
-    let mut st = match state.lock() {
-        Ok(s) => s,
-        Err(_) => return Response::error_html("Internal state lock error"),
-    };
+    // Persist BEFORE acknowledging success. If the data dir is unwritable, the
+    // node must learn enrollment did not durably land rather than be told ok and
+    // silently vanish on the next restart — so roll the in-memory push back and
+    // return an error that keeps memory consistent with disk.
     st.endpoints.push(ep);
     if let Err(e) = save(&st.endpoints) {
-        eprintln!("{NAME}: failed to persist endpoints: {e}");
+        st.endpoints.pop();
+        eprintln!("{NAME}: failed to persist endpoint {id}: {e}");
+        return Response {
+            status: "500 Internal Server Error",
+            content_type: "application/json",
+            extra: vec![],
+            body: "{\"ok\":false,\"error\":\"failed to persist endpoint\"}\n".to_string(),
+        };
     }
-    Response::ok_json(format!("{{\"ok\":true,\"id\":\"{id}\"}}\n"))
+    Response::ok_json(format!(
+        "{{\"ok\":true,\"id\":\"{id}\",\"overlay_ipv4\":\"{overlay_ipv4}\"}}\n"
+    ))
 }
 
 fn delete_endpoint(
@@ -649,11 +686,14 @@ fn render_dashboard(
                 } else {
                     e.endpoint_addr.clone()
                 };
+                let overlay = crate::ipam::overlay_addr_string(&e.allowed_ips)
+                    .unwrap_or_else(|| "—".to_string());
                 format!(
                     "<tr>\
                      <td>{name}</td>\
                      <td class=\"code\" title=\"{pk_full}\">{pk_short}</td>\
                      <td>{ep}</td>\
+                     <td class=\"code\">Overlay IP: {overlay}</td>\
                      <td>{ips}</td>\
                      <td>{by}</td>\
                      <td>\
@@ -667,6 +707,7 @@ fn render_dashboard(
                     pk_full = html_esc(&e.public_key),
                     pk_short = html_esc(&pk_short),
                     ep = html_esc(&ep_disp),
+                    overlay = html_esc(&overlay),
                     ips = html_esc(&ips),
                     by = html_esc(&e.added_by),
                     id = html_esc(&e.id),
@@ -678,7 +719,7 @@ fn render_dashboard(
             "<table>\
              <thead><tr>\
                <th>Name</th><th>Public Key</th><th>Endpoint</th>\
-               <th>Allowed IPs</th><th>Added By</th><th></th>\
+               <th>Overlay IP</th><th>Allowed IPs</th><th>Added By</th><th></th>\
              </tr></thead>\
              <tbody>{rows}</tbody>\
              </table>"
@@ -833,6 +874,27 @@ mod tests {
         };
         let html = render_dashboard(&user, "csrf-value", &[]);
         assert!(html.contains(r#"name="csrf_token" value="csrf-value""#));
+    }
+
+    #[test]
+    fn dashboard_surfaces_overlay_ip() {
+        let user = AuthUser {
+            sub: "sub".to_string(),
+            email: "user@example.com".to_string(),
+            name: "User".to_string(),
+        };
+        let ep = crate::vpn_endpoint::VpnEndpoint {
+            id: "n1".to_string(),
+            name: "midget".to_string(),
+            public_key: "pk".to_string(),
+            endpoint_addr: String::new(),
+            allowed_ips: vec!["100.88.0.2/32".to_string()],
+            added_by: "user@example.com".to_string(),
+            added_at: 1,
+        };
+        let html = render_dashboard(&user, "csrf", std::slice::from_ref(&ep));
+        assert!(html.contains("Overlay IP: 100.88.0.2"));
+        assert!(html.contains("<th>Overlay IP</th>"));
     }
 
     #[test]
