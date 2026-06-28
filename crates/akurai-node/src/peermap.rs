@@ -1,14 +1,9 @@
-//! Peer-map watch (stub — DO NOT implement here).
+//! Peer-map handling.
 //!
-//! Subscribes to the control plane's peer-map stream and updates local peer
-//! sessions, routes, and DNS as the network changes. It needs the (undecided)
-//! transport, so it is a stub in 0.0.1.
+//! Initial host-only mode does not subscribe to subnet, exit, or gateway route
+//! updates. The peer map will only contain AkurAI-VPN nodes once enrollment is
+//! implemented.
 
-use crate::error::NodeError;
-use crate::tun::TunDevice;
-
-/// Start watching the peer map and applying updates. **Stub** — returns
-/// [`NodeError::NotImplemented`].
-pub fn watch(_device: &TunDevice) -> Result<(), NodeError> {
-    Err(NodeError::NotImplemented("peer-map watch stream"))
+pub fn host_only_notice() {
+    eprintln!("akurai-node: host-only peer map; subnet and exit routes disabled");
 }

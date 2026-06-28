@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "AkurAI VPN node daemon: TUN device, route application, peer-map watch, gateway modes (0.0.1 skeleton)."
+description = "AkurAI VPN node daemon: host-only node install and membership state. No subnet or exit routing by default."
 
 [[bin]]
 name = "akurai-node"

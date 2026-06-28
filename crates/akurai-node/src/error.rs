@@ -7,8 +7,8 @@ use std::fmt;
 /// [`NodeError::Usage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeError {
-    /// A data-plane operation that is deliberately a stub in 0.0.1.
-    NotImplemented(&'static str),
+    /// Filesystem or process I/O failed.
+    Io(String),
     /// A command-line usage problem.
     Usage(String),
 }
@@ -16,12 +16,16 @@ pub enum NodeError {
 impl fmt::Display for NodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NodeError::NotImplemented(what) => {
-                write!(f, "{what} is not implemented in 0.0.1")
-            }
+            NodeError::Io(msg) => write!(f, "{msg}"),
             NodeError::Usage(msg) => write!(f, "{msg}"),
         }
     }
 }
 
 impl std::error::Error for NodeError {}
+
+impl From<std::io::Error> for NodeError {
+    fn from(value: std::io::Error) -> Self {
+        NodeError::Io(value.to_string())
+    }
+}

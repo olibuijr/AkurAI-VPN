@@ -1,18 +1,17 @@
 //! `akurai-node` — the AkurAI VPN node daemon, installed on every device.
 //!
-//! Creates the `akurai0` TUN interface, applies routes pushed by the control
-//! plane, watches the peer map, and (when approved) acts as a subnet/exit
-//! gateway. This is a 0.0.1 skeleton: the device, routing, and transport are
-//! stubs that return explicit "not implemented" errors rather than touching the
-//! system. Command dispatch (`up`/`down`/`status`/`gateway`) is parsed from
-//! `std::env::args` by hand to keep the zero-dependency promise.
+//! Initial scope is deliberately host-only: a node can install local state and
+//! mark itself up for AkurAI-VPN host-to-host membership, but it does not install
+//! subnet routes, exit routes, or gateway advertisements. Command dispatch is
+//! parsed from `std::env::args` by hand to keep the zero-dependency promise.
 
 mod error;
-mod gateway;
 mod peermap;
-mod route;
 mod tun;
 
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use error::NodeError;
@@ -37,13 +36,14 @@ fn run(args: &[String]) -> Result<(), NodeError> {
             println!("{NAME} {VERSION}");
             Ok(())
         }
+        Some("install") => install(&args[1..]),
         Some("up") => up(&args[1..]),
         Some("down") => down(),
-        Some("status") => {
-            status();
+        Some("status") => status(&args[1..]),
+        Some("path") => {
+            println!("{}", node_home(&args[1..])?.display());
             Ok(())
         }
-        Some("gateway") => gateway::dispatch(&args[1..]),
         Some("help" | "--help" | "-h") | None => {
             print_usage();
             Ok(())
@@ -56,34 +56,77 @@ fn run(args: &[String]) -> Result<(), NodeError> {
     }
 }
 
-/// Bring the overlay up: open `akurai0`, apply routes, start the peer-map watch.
-fn up(args: &[String]) -> Result<(), NodeError> {
-    if let Some(key) = auth_key(args) {
-        eprintln!("akurai-node: would enroll with auth key {key} (not implemented in 0.0.1)");
+/// Install the node into the local per-user AkurAI-VPN home.
+fn install(args: &[String]) -> Result<(), NodeError> {
+    let home = node_home(args)?;
+    let dirs = NodeDirs::new(home);
+    dirs.create()?;
+
+    let current_exe = std::env::current_exe()?;
+    let installed_exe = dirs.bin.join(NAME);
+    fs::copy(&current_exe, &installed_exe)?;
+
+    if !dirs.config_file.exists() {
+        let hostname = std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| fs::read_to_string("/etc/hostname").ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown-host".to_string());
+        write_file(
+            &dirs.config_file,
+            &format!("version={VERSION}\nmode=host-only\nhostname={hostname}\nrouting=disabled\n"),
+        )?;
     }
-    let device = tun::open(akurai_common::TUN_INTERFACE)?;
-    route::apply(&device, &route::overlay_defaults())?;
-    peermap::watch(&device)?;
+    write_state(&dirs, "installed")?;
+
+    println!("installed {NAME} {VERSION}");
+    println!("  home : {}", dirs.home.display());
+    println!("  bin  : {}", installed_exe.display());
+    println!("  mode : host-only (routing disabled)");
     Ok(())
 }
 
-/// Tear the overlay down: stop the watch and close `akurai0`.
+/// Bring host-only membership up without installing subnet or exit routes.
+fn up(args: &[String]) -> Result<(), NodeError> {
+    let home = node_home(args)?;
+    let dirs = NodeDirs::new(home);
+    dirs.create()?;
+    if let Some(key) = auth_key(args) {
+        write_file(&dirs.auth_key_file, key)?;
+    }
+    tun::host_only_notice(akurai_common::TUN_INTERFACE);
+    peermap::host_only_notice();
+    write_state(&dirs, "up")?;
+    println!("{NAME}: host-only membership is up");
+    println!("  home    : {}", dirs.home.display());
+    println!("  routing : disabled");
+    Ok(())
+}
+
+/// Tear host-only membership down.
 fn down() -> Result<(), NodeError> {
-    tun::close(akurai_common::TUN_INTERFACE)
+    let dirs = NodeDirs::new(node_home(&[])?);
+    dirs.create()?;
+    write_state(&dirs, "down")?;
+    println!("{NAME}: host-only membership is down");
+    println!("  home    : {}", dirs.home.display());
+    println!("  routing : disabled");
+    Ok(())
 }
 
 /// Print local overlay status.
-fn status() {
-    use akurai_common::overlay;
+fn status(args: &[String]) -> Result<(), NodeError> {
+    let home = node_home(args)?;
+    let dirs = NodeDirs::new(home);
+    let state = fs::read_to_string(&dirs.state_file)
+        .unwrap_or_else(|_| "state=not-installed\n".to_string());
     println!("{NAME} {VERSION}");
-    println!("  interface : {}", overlay::TUN_INTERFACE);
-    println!(
-        "  overlay   : 100.88.0.0/{} , fd88::/{} , MTU {}",
-        overlay::OVERLAY_IPV4_PREFIX_LEN,
-        overlay::OVERLAY_IPV6_PREFIX_LEN,
-        overlay::OVERLAY_MTU
-    );
-    println!("  state     : down (data plane not implemented in 0.0.1)");
+    println!("  home    : {}", dirs.home.display());
+    println!("  mode    : host-only");
+    println!("  routing : disabled");
+    print!("{state}");
+    Ok(())
 }
 
 /// Extract `--auth-key <value>` from the argument list, if present.
@@ -101,13 +144,125 @@ fn print_usage() {
     println!("{NAME} {VERSION} — AkurAI VPN node daemon");
     println!();
     println!("USAGE:");
-    println!("    {NAME} <command>");
+    println!("    {NAME} <command> [--home <path>]");
     println!();
     println!("COMMANDS:");
-    println!("    up [--auth-key <key>]   Bring the overlay up (not implemented in 0.0.1)");
-    println!("    down                    Tear the overlay down (not implemented in 0.0.1)");
-    println!("    status                  Show local overlay status");
-    println!("    gateway <subcommand>    Manage gateway modes (subnet/exit)");
+    println!("    install                 Install into ~/.akurai-vpn by default");
+    println!("    up [--auth-key <key>]   Enable host-only membership (no routing)");
+    println!("    down                    Disable host-only membership");
+    println!("    status                  Show local node status");
+    println!("    path                    Print the resolved AkurAI-VPN home");
     println!("    version                 Print version and exit");
     println!("    help                    Show this help");
+    println!();
+    println!("OPTIONS:");
+    println!("    --home <path>           Override the default ~/.akurai-vpn path");
+}
+
+fn node_home(args: &[String]) -> Result<PathBuf, NodeError> {
+    if let Some(path) = arg_value(args, "--home") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("AKURAI_VPN_HOME") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        NodeError::Usage("HOME is not set; pass --home <path> or set AKURAI_VPN_HOME".to_string())
+    })?;
+    Ok(Path::new(&home).join(".akurai-vpn"))
+}
+
+fn arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == key {
+            return it.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+struct NodeDirs {
+    home: PathBuf,
+    bin: PathBuf,
+    state: PathBuf,
+    config: PathBuf,
+    config_file: PathBuf,
+    state_file: PathBuf,
+    auth_key_file: PathBuf,
+}
+
+impl NodeDirs {
+    fn new(home: PathBuf) -> Self {
+        let bin = home.join("bin");
+        let state = home.join("state");
+        let config = home.join("config");
+        let config_file = config.join("node.conf");
+        let state_file = state.join("node.state");
+        let auth_key_file = config.join("auth.key");
+        Self {
+            home,
+            bin,
+            state,
+            config,
+            config_file,
+            state_file,
+            auth_key_file,
+        }
+    }
+
+    fn create(&self) -> Result<(), NodeError> {
+        fs::create_dir_all(&self.bin)?;
+        fs::create_dir_all(&self.state)?;
+        fs::create_dir_all(&self.config)?;
+        Ok(())
+    }
+}
+
+fn write_state(dirs: &NodeDirs, state: &str) -> Result<(), NodeError> {
+    write_file(
+        &dirs.state_file,
+        &format!("state={state}\nmode=host-only\nrouting=disabled\n"),
+    )
+}
+
+fn write_file(path: &Path, content: &str) -> Result<(), NodeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_home_overrides_default() {
+        let args = vec!["--home".to_string(), "/tmp/akurai-vpn-test".to_string()];
+        assert_eq!(
+            node_home(&args).unwrap(),
+            PathBuf::from("/tmp/akurai-vpn-test")
+        );
+    }
+
+    #[test]
+    fn auth_key_is_parsed_independently_of_home() {
+        let args = vec![
+            "--home".to_string(),
+            "/tmp/akurai-vpn-test".to_string(),
+            "--auth-key".to_string(),
+            "secret".to_string(),
+        ];
+        assert_eq!(auth_key(&args), Some("secret"));
+    }
 }

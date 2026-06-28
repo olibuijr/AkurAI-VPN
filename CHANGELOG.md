@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-06-28
+
+- Add host-only node install defaults
+
+
 ## [0.0.6] - 2026-06-28
 
 - Harden VPN control sessions and validation
