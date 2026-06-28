@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-06-28
+
+- Harden VPN control sessions and validation
+
+
 ## [0.0.5] - 2026-06-27
 
 ### Added

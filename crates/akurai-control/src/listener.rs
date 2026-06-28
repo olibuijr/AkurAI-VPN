@@ -59,6 +59,12 @@ struct Request {
     body: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuthSession {
+    user: AuthUser,
+    csrf_token: String,
+}
+
 // ---------------------------------------------------------------------------
 // Response
 // ---------------------------------------------------------------------------
@@ -313,14 +319,14 @@ fn route(req: &Request, state: &SharedState) -> Response {
             let id = p
                 .trim_start_matches("/api/endpoints/")
                 .trim_end_matches("/delete");
-            delete_endpoint(id, &user, state)
+            delete_endpoint(id, &user, req, state)
         }
         (Method::Delete, p) if p.starts_with("/api/endpoints/") => {
             let Some(user) = require_auth(req, state) else {
                 return Response::redirect("/login");
             };
             let id = p.trim_start_matches("/api/endpoints/");
-            delete_endpoint(id, &user, state)
+            delete_endpoint(id, &user, req, state)
         }
         _ => Response::not_found(),
     }
@@ -404,6 +410,8 @@ fn handle_callback(req: &Request, state: &SharedState) -> Response {
     );
     if let Ok(mut st) = state.lock() {
         st.sessions.insert(session_token.clone(), user);
+        st.csrf_tokens
+            .insert(session_token.clone(), auth::random_token());
     }
 
     let set_cookie = format!(
@@ -417,6 +425,7 @@ fn handle_logout(req: &Request, state: &SharedState) -> Response {
         if let Some(token) = auth::parse_session_cookie(cookie) {
             if let Ok(mut st) = state.lock() {
                 st.sessions.remove(&token);
+                st.csrf_tokens.remove(&token);
             }
         }
     }
@@ -438,10 +447,10 @@ fn handle_dashboard(req: &Request, state: &SharedState) -> Response {
         .ok()
         .map(|s| s.endpoints.clone())
         .unwrap_or_default();
-    Response::ok_html(render_dashboard(&user, &endpoints))
+    Response::ok_html(render_dashboard(&user.user, &user.csrf_token, &endpoints))
 }
 
-fn handle_list_endpoints(_user: &AuthUser, state: &SharedState) -> Response {
+fn handle_list_endpoints(_user: &AuthSession, state: &SharedState) -> Response {
     let json = state
         .lock()
         .ok()
@@ -456,7 +465,10 @@ fn handle_list_endpoints(_user: &AuthUser, state: &SharedState) -> Response {
     Response::ok_json(format!("[{json}]\n"))
 }
 
-fn add_endpoint_json(req: &Request, user: &AuthUser, state: &SharedState) -> Response {
+fn add_endpoint_json(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::bad_request("invalid csrf token");
+    }
     let name = auth::extract_json_str(&req.body, "name").unwrap_or_default();
     let public_key = auth::extract_json_str(&req.body, "public_key").unwrap_or_default();
     let endpoint_addr = auth::extract_json_str(&req.body, "endpoint").unwrap_or_default();
@@ -465,10 +477,20 @@ fn add_endpoint_json(req: &Request, user: &AuthUser, state: &SharedState) -> Res
     if name.is_empty() || public_key.is_empty() {
         return Response::bad_request("name and public_key are required");
     }
-    do_add_endpoint(name, public_key, endpoint_addr, allowed_ips, user, state)
+    do_add_endpoint(
+        name,
+        public_key,
+        endpoint_addr,
+        allowed_ips,
+        &session.user,
+        state,
+    )
 }
 
-fn add_endpoint_form(req: &Request, user: &AuthUser, state: &SharedState) -> Response {
+fn add_endpoint_form(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::error_html("Invalid CSRF token");
+    }
     let params = auth::parse_form(&req.body);
     let name = params.get("name").cloned().unwrap_or_default();
     let public_key = params.get("public_key").cloned().unwrap_or_default();
@@ -486,7 +508,14 @@ fn add_endpoint_form(req: &Request, user: &AuthUser, state: &SharedState) -> Res
     if name.is_empty() || public_key.is_empty() {
         return Response::error_html("name and public_key are required");
     }
-    let result = do_add_endpoint(name, public_key, endpoint_addr, allowed_ips, user, state);
+    let result = do_add_endpoint(
+        name,
+        public_key,
+        endpoint_addr,
+        allowed_ips,
+        &session.user,
+        state,
+    );
     if result.status.starts_with("2") || result.status.starts_with("3") {
         Response::redirect("/dashboard")
     } else {
@@ -526,7 +555,15 @@ fn do_add_endpoint(
     Response::ok_json(format!("{{\"ok\":true,\"id\":\"{id}\"}}\n"))
 }
 
-fn delete_endpoint(id: &str, _user: &AuthUser, state: &SharedState) -> Response {
+fn delete_endpoint(
+    id: &str,
+    session: &AuthSession,
+    req: &Request,
+    state: &SharedState,
+) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::bad_request("invalid csrf token");
+    }
     let mut st = match state.lock() {
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
@@ -546,10 +583,24 @@ fn delete_endpoint(id: &str, _user: &AuthUser, state: &SharedState) -> Response 
 // Auth helper
 // ---------------------------------------------------------------------------
 
-fn require_auth(req: &Request, state: &SharedState) -> Option<AuthUser> {
+fn require_auth(req: &Request, state: &SharedState) -> Option<AuthSession> {
     let cookie = req.headers.get("cookie")?;
     let token = auth::parse_session_cookie(cookie)?;
-    state.lock().ok()?.sessions.get(&token).cloned()
+    let st = state.lock().ok()?;
+    let user = st.sessions.get(&token).cloned()?;
+    let csrf_token = st.csrf_tokens.get(&token).cloned()?;
+    Some(AuthSession { user, csrf_token })
+}
+
+fn csrf_valid(req: &Request, session: &AuthSession) -> bool {
+    csrf_from_request(req).as_deref() == Some(session.csrf_token.as_str())
+}
+
+fn csrf_from_request(req: &Request) -> Option<String> {
+    req.headers
+        .get("x-csrf-token")
+        .cloned()
+        .or_else(|| auth::parse_form(&req.body).get("csrf_token").cloned())
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +619,11 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 // HTML templates
 // ---------------------------------------------------------------------------
 
-fn render_dashboard(user: &AuthUser, endpoints: &[crate::vpn_endpoint::VpnEndpoint]) -> String {
+fn render_dashboard(
+    user: &AuthUser,
+    csrf_token: &str,
+    endpoints: &[crate::vpn_endpoint::VpnEndpoint],
+) -> String {
     let table = if endpoints.is_empty() {
         r#"<p class="empty">No VPN endpoints registered yet. Add one below.</p>"#.to_string()
     } else {
@@ -595,6 +650,7 @@ fn render_dashboard(user: &AuthUser, endpoints: &[crate::vpn_endpoint::VpnEndpoi
                      <td>{by}</td>\
                      <td>\
                        <form method=\"POST\" action=\"/api/endpoints/{id}/delete\" style=\"margin:0\">\
+                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                          <button type=\"submit\" class=\"btn btn-danger\">Delete</button>\
                        </form>\
                      </td>\
@@ -606,6 +662,7 @@ fn render_dashboard(user: &AuthUser, endpoints: &[crate::vpn_endpoint::VpnEndpoi
                     ips = html_esc(&ips),
                     by = html_esc(&e.added_by),
                     id = html_esc(&e.id),
+                    csrf = html_esc(csrf_token),
                 )
             })
             .collect();
@@ -666,6 +723,7 @@ input:focus{{outline:none;border-color:#3b82f6}}
 
 <h2>Add Endpoint</h2>
 <form method="POST" action="/api/endpoints/add" class="add-form">
+  <input type="hidden" name="csrf_token" value="{csrf_token}">
   <div class="field">
     <label for="f-name">Name</label>
     <input id="f-name" name="name" type="text" placeholder="home-server" required>
@@ -696,6 +754,7 @@ input:focus{{outline:none;border-color:#3b82f6}}
             }
         },
         table = table,
+        csrf_token = html_esc(csrf_token),
     )
 }
 
@@ -726,4 +785,45 @@ fn html_esc(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(headers: &[(&str, &str)], body: &str) -> Request {
+        Request {
+            method: Method::Post,
+            path: "/api/endpoints/add".to_string(),
+            query: String::new(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn csrf_token_can_come_from_header() {
+        let req = request(&[("x-csrf-token", "abc123")], "");
+        assert_eq!(csrf_from_request(&req).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn csrf_token_can_come_from_form_body() {
+        let req = request(&[], "name=node&csrf_token=form-token");
+        assert_eq!(csrf_from_request(&req).as_deref(), Some("form-token"));
+    }
+
+    #[test]
+    fn dashboard_forms_include_csrf_token() {
+        let user = AuthUser {
+            sub: "sub".to_string(),
+            email: "user@example.com".to_string(),
+            name: "User".to_string(),
+        };
+        let html = render_dashboard(&user, "csrf-value", &[]);
+        assert!(html.contains(r#"name="csrf_token" value="csrf-value""#));
+    }
 }
