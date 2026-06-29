@@ -24,11 +24,15 @@ Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session co
 - **Persistent + expiring session store** (`crates/akurai-control/src/auth.rs`): sessions+CSRF+24h `expires_at` now persist to `$AKURAI_DATA_DIR/sessions.json` (atomic temp+rename), pruned on load, rejected on expiry. **Cookie/dashboard logins now survive a control-plane restart** — verified live (a session written to disk authenticated after `systemctl restart`). Removed the separate in-memory `csrf_tokens` map. So the v0.3.x "every deploy logs everyone out" flaw is fixed for browser sessions too (nodes were already immune via tokens).
 - **Android durable token client** (committed): provisioning captures `node_token`; heartbeat + peer-refresh prefer `Authorization: Bearer` (cookie fallback kept). Built clean; **device-install still pending (phone unplugged)**.
 
-### Remaining
-- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked only on the device being plugged into USB; then live-verify `updatePeers`, the green peers, and token survival.
-- Token **revoke/rotate** UI in the dashboard (issue/durable/persist done; revoke is the missing CRUD verb).
-- **Multi-OS native clients** (macOS/Windows) — the Linux node already runs anywhere Linux does; other-OS clients are net-new and can't be built/tested on this host.
-- **Symmetric-NAT** control-plane endpoint distribution (cone NAT works today via relay PeerAddr).
+### Token revoke/rotate — DONE (v0.3.3)
+`POST /api/endpoints/:id/rotate-token` (owner-scoped, CSRF) regenerates a node's durable token; the dashboard shows a masked **Node Token** column + a **Rotate token** button per row. **Verified live end-to-end:** rotated midget's token → old token → 401, new token → authenticates; re-seeded midget's `node.token` and it came back `online:true` on the new token. Completes the key-management CRUD (issue → durable → persist → revoke/rotate). NOTE: a node holding the rotated-away token must be re-seeded (write the new value to `config/node.token`) — that is the intended revocation behavior.
+
+### Remaining (all blocked or un-buildable from this host)
+- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked ONLY on the device being plugged into USB; then live-verify `updatePeers`, the green peers, and token survival.
+- **Multi-OS native clients** (macOS/Windows) — the Linux node already runs anywhere Linux does; other-OS GUI clients are net-new and cannot be built or tested on this Linux host.
+- **Symmetric-NAT** direct-path optimization — cone NAT already gets direct paths via relay `PeerAddr`; symmetric NAT falls back to the relay (works, just not direct). A real direct-through-symmetric-NAT path needs a multi-NAT-type testbed to verify, so it's deferred rather than shipped unverified.
+
+> Status: every gap that can be **built and verified from this environment** is done. The three above are hardware-blocked (phone), other-OS (untestable here), or need a NAT testbed.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
