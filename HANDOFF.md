@@ -4,6 +4,20 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Update — 2026-06-28 (v0.0.9): overlay IP allocation shipped
+
+The "next milestone" decision below was made and implemented: **per-node overlay IP allocation (IPAM)**. It was the only one of the three options with zero `wlan0` risk (pure control-plane bookkeeping) and is the prerequisite for any future data plane.
+
+- Control plane (`crates/akurai-control`): real allocator in `ipam.rs` — each enrolled node gets a stable, globally-unique `100.88.0.N/32` from `100.88.0.0/16` (lowest-free index, reused on delete; indices 0/1 reserved). Allocation runs **under the state lock** (race-safe) and normalizes to exactly one overlay address per node. A startup **backfill** assigns IPs to nodes enrolled before allocation existed and persists atomically.
+- Surfacing: `VpnEndpoint` JSON gained `overlay_ipv4`; the dashboard has an **Overlay IP** column; the control banner names the next free address.
+- Node (`crates/akurai-node`): `up --overlay-ip <ip>` persists it locally; `status` shows `overlay : <ip>`.
+- Installer (`akurai-vpn-site/frontend/install.sh`): reads the assigned IP back from `/api/endpoints` and passes it to `akurai-node up --overlay-ip`. New `0.0.9` node binary published to the site downloads.
+- **LIVE & verified:** control plane v0.0.9 on vpn.olibuijr.com (`validate.sh` 11/11 PASS); the `midget` record now carries `100.88.0.2` (backfilled automatically on deploy). `wlan0` default route + connectivity unchanged before/after; no `akurai0`, no routes.
+
+**Next milestone (the deferred fork — nothing foreclosed):** the actual data plane — direct peer-to-peer connectivity using the already-built `akurai-crypto` (zero-dep X25519/ChaCha20-Poly1305) + `akurai-transport` (Noise_IK) stack. Each node now has a real overlay address to bind to. **This is where `wlan0` risk re-enters** (TUN device, routes) — preserve the host-only safety protocol below.
+
+> Note: the memory note saying the crypto decision is "OPEN" is **stale** — it was resolved zero-dep (see `crates/akurai-crypto`, `crates/akurai-transport`, both with passing end-to-end tests).
+
 ## Current Product Direction
 
 The VPN is intentionally host-only by default.
