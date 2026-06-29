@@ -407,6 +407,82 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Diagnostic: bring up the TUN and echo ICMP echo-requests straight back as
+/// replies for `secs` seconds. Pinging any overlay IP (routed to the TUN) gets a
+/// reply **iff** `TunDevice::recv` and `send` move packets correctly on this
+/// platform — so this runtime-verifies the platform packet path (the macOS
+/// 4-byte AF header / the Windows Wintun ring) on real hardware, without needing
+/// a second machine.
+pub fn selftest(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
+    let tun = akurai_sys::create_tun(&cfg.iface)?;
+    let iface = tun.name().to_string();
+    setup_interface(&cfg, &iface)?;
+    eprintln!(
+        "akurai-node: selftest TUN up — overlay {} on {iface}, echoing ICMP for {secs}s",
+        cfg.overlay_ip
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut buf = [0u8; 2048];
+    let mut echoed = 0u32;
+    while std::time::Instant::now() < deadline {
+        let n = match tun.recv(&mut buf) {
+            Ok(0) => continue,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(_) => continue,
+        };
+        if let Some(reply) = icmp_echo_reply(&buf[..n]) {
+            if tun.send(&reply).is_ok() {
+                echoed += 1;
+                eprintln!("akurai-node: selftest echoed ICMP reply #{echoed}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// If `pkt` is an IPv4 ICMP echo *request*, build the matching echo *reply*
+/// (swap src/dst, type 8→0, recompute the ICMP checksum). The IPv4 header
+/// checksum is unchanged because swapping src↔dst leaves the 16-bit word sum
+/// invariant. Returns `None` for anything that is not an ICMP echo request.
+fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.len() < 28 || (pkt[0] >> 4) != 4 {
+        return None; // need ≥20B IPv4 header + ≥8B ICMP; IPv4 only
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 1 || pkt[ihl] != 8 {
+        return None; // proto must be ICMP (1) and type echo-request (8)
+    }
+    let mut out = pkt.to_vec();
+    for i in 0..4 {
+        out.swap(12 + i, 16 + i); // swap source and destination IPv4 addresses
+    }
+    out[ihl] = 0; // ICMP echo reply
+    out[ihl + 2] = 0;
+    out[ihl + 3] = 0;
+    let csum = checksum16(&out[ihl..]);
+    out[ihl + 2] = (csum >> 8) as u8;
+    out[ihl + 3] = (csum & 0xff) as u8;
+    Some(out)
+}
+
+/// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian words.
+fn checksum16(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// Read packets from the TUN, encrypt to the routing peer (initiating a handshake
 /// via the relay on first contact), and send `Data` frames on the peer\'s current
 /// path (direct if confirmed, else the relay).
@@ -606,5 +682,36 @@ fn udp_pump(pump: Pump) {
             }
             FrameKind::Keepalive => {} // direct-path confirmation handled above
         }
+    }
+}
+
+#[cfg(test)]
+mod selftest_tests {
+    use super::*;
+
+    #[test]
+    fn echo_request_becomes_reply() {
+        // IPv4 (20B) + ICMP echo request (type 8). src 1.1.1.1, dst 2.2.2.2.
+        let mut pkt = vec![
+            0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0, 0, // IPv4 header
+            1, 1, 1, 1, 2, 2, 2, 2, // src, dst
+            8, 0, 0, 0, 0, 1, 0, 1, // ICMP echo request
+        ];
+        pkt[22] = 0xf7; // any non-zero icmp checksum; the reply recomputes it
+        pkt[23] = 0xfd;
+        let reply = icmp_echo_reply(&pkt).expect("should transform");
+        assert_eq!(&reply[12..16], &[2, 2, 2, 2]); // src now the old dst
+        assert_eq!(&reply[16..20], &[1, 1, 1, 1]); // dst now the old src
+        assert_eq!(reply[20], 0); // ICMP type echo-reply
+        assert_eq!(checksum16(&reply[20..]), 0); // valid ⇒ folds to zero
+    }
+
+    #[test]
+    fn non_icmp_is_ignored() {
+        let tcp = vec![
+            0x45u8, 0, 0, 28, 0, 0, 0, 0, 64, 6, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0,
+            0,
+        ];
+        assert!(icmp_echo_reply(&tcp).is_none());
     }
 }

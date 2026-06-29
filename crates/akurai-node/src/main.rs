@@ -47,6 +47,7 @@ fn run(args: &[String]) -> Result<(), NodeError> {
         Some("install") => install(&args[1..]),
         Some("up") => up(&args[1..]),
         Some("tunnel") => tunnel_cmd(&args[1..]),
+        Some("selftest") => selftest_cmd(&args[1..]),
         Some("service-install") => service_install(&args[1..]),
         Some("down") => down(),
         Some("status") => status(&args[1..]),
@@ -275,6 +276,51 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         node_token: node_token.clone(),
     };
     tunnel::run(cfg)?;
+    Ok(())
+}
+
+/// Diagnostic: bring up the TUN and echo ICMP for a few seconds, so a `ping` to
+/// any overlay IP proves the platform recv/send packet path works at runtime.
+/// `--overlay-ip <ip>` (default 100.88.0.3), `--secs <n>` (default 10),
+/// `--iface <name>` (default akurai0). Requires CAP_NET_ADMIN / root.
+fn selftest_cmd(args: &[String]) -> Result<(), NodeError> {
+    let dirs = NodeDirs::new(node_home(args)?);
+    dirs.create()?;
+    let id = identity::Identity::load_or_create(
+        &dirs.config.join("identity.key"),
+        &dirs.config.join("identity.pub"),
+    )?;
+    let iface = arg_value(args, "--iface").unwrap_or("akurai0").to_string();
+    let overlay_ip: Ipv4Addr = arg_value(args, "--overlay-ip")
+        .unwrap_or("100.88.0.3")
+        .parse()
+        .map_err(|_| NodeError::Usage("invalid overlay ip".to_string()))?;
+    let secs: u64 = arg_value(args, "--secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let overlay_cidr = format!(
+        "{}/{}",
+        akurai_common::OVERLAY_IPV4_NET,
+        akurai_common::OVERLAY_IPV4_PREFIX_LEN
+    );
+    let cfg = tunnel::TunnelConfig {
+        iface,
+        overlay_ip,
+        overlay_cidr,
+        mtu: akurai_common::OVERLAY_MTU,
+        relay: "127.0.0.1:51820"
+            .parse()
+            .expect("static loopback addr parses"),
+        keypair: id.keypair,
+        peers: peers::PeerTable::from_peers(Vec::new()),
+        advertise: Vec::new(),
+        exit_node: None,
+        acl: None,
+        control_url: None,
+        cookie_jar: None,
+        node_token: None,
+    };
+    tunnel::selftest(cfg, secs)?;
     Ok(())
 }
 
