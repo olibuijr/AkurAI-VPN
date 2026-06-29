@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-29
+
+### Added
+- node-token revoke/rotate (dashboard + POST /api/endpoints/:id/rotate-token)
+
+### Changed
+- HANDOFF — persistent session store (v0.3.2) + Android token client done
+
+
+
 ## [0.3.2] - 2026-06-29
 
 ### Added

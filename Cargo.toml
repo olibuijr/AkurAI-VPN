@@ -14,7 +14,7 @@ members = ["crates/akurai-common", "crates/akurai-crypto", "crates/akurai-transp
 # official RFC test vectors. The hand-rolled-crypto risk is accepted deliberately.
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/olibuijr/AkurAI-VPN"
