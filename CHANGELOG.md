@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-29
+
+### Added
+- MVP2 exit gateway (full-tunnel) with hard safety guard
+- MVP3 direct peer-to-peer mesh with relay fallback
+- MagicDNS — resolve <peer>.akurai to overlay IP
+- one-touch systemd tunnel daemon + network.conf + DNS relay resolve
+- MagicDNS resolver + DNS wire codec for *.akurai names
+- MVP2 subnet gateway — advertise + route_to + forwarding
+
+### Fixed
+- MagicDNS netns test uses per-netns resolv.conf, never touches host DNS
+
+### Changed
+- architecture, protocol, networking for the data plane
+- record v0.1.0 working mesh data plane + ufw gotcha + MVP2-4 roadmap
+
+
+
 ## [0.1.0] - 2026-06-29
 
 ### Added
