@@ -43,15 +43,18 @@ So macOS is a **functionally-real client** (its data plane is implemented and co
 ### Windows data plane — DONE (real Wintun)
 `crates/akurai-sys/src/tun.rs` Windows path now dynamically loads `wintun.dll` (`LoadLibraryW`/`GetProcAddress`) and runs a real adapter/session (recv via the read-wait event, send via the ring) — no stub. `setup_interface` has a `netsh` path; node RNG goes through a cross-platform `rng::fill_random` seam (`/dev/urandom` unix, `BCryptGenRandom` windows). **Verified: the node builds AND LINKS on a real `windows-latest` MSVC runner** (linking `kernel32`+`bcrypt`), and on a real `macos-latest` runner. Both desktop client binaries are uploaded as CI artifacts (`akurai-node-macos-latest`, `akurai-node-windows-latest`).
 
-### Remaining — runtime verification on physical hardware only
-Every client now has a **real data plane that builds + links on its real OS** (Linux live; Android APK self-serve; macOS utun + Windows Wintun built on real CI runners, binaries downloadable). The only thing not done is **actually running each on the target hardware**:
-- macOS: download the `akurai-node-macos-latest` artifact, run on a Mac (utun needs root), confirm it tunnels.
-- Windows: download `akurai-node-windows-latest`, install the Wintun driver, run as admin, confirm it tunnels.
-- Phone: live re-verify the self-serve APK on the device.
+### Desktop data planes — RUNTIME-VERIFIED on real macOS + Windows (CI)
+The `runtime-smoke` CI job actually RUNS the client on `macos-latest` + `windows-latest` and asserts the data-plane device comes up:
+- **macOS**: `akurai-node: tunnel up — overlay 100.88.0.3 …` + `add net 100.88.0.0: gateway utun4` — a real **utun4** created, brought up, overlay route installed.
+- **Windows**: downloads `wintun.dll`, then `akurai-node: tunnel up …` + `PASS: Windows Wintun data plane came up` — a real **Wintun adapter** created and set up.
 
-CI runners can't create a TUN/utun/Wintun device with the needed privileges, so runtime is the one step that genuinely requires the physical machines.
+So the platform-specific FFI device-create + interface-setup paths (the riskiest part of a port) are **runtime-proven on the real OSes**. The packet pump on top is the same cross-platform code proven end-to-end on Linux (netns 7/7).
 
-> Status: **a complete, multi-platform Tailscale alternative at the code + build level** — encrypted mesh, control plane, cone+symmetric NAT, gateways, MagicDNS, ACL, durable+rotatable auth, persistent sessions, self-healing nodes, and **clients for Linux, Android, macOS, and Windows** (all data planes real, all builds verified on real runners). The remaining work is runtime verification on the physical Mac/Windows/phone hardware.
+### Remaining — only full end-to-end on physical multi-node desktops + the phone
+- A two-desktop **end-to-end traffic** test (node↔node passing encrypted packets) needs two real Mac/Windows machines or per-host network isolation CI can't easily provide on those OSes — the device + pump are each verified, but their combination on desktop isn't exercised in one CI host (overlay-route conflict with two TUNs on one box).
+- **Phone**: live re-verify the self-serve APK on the device (USB).
+
+> Status: **a complete, multi-platform Tailscale alternative** — encrypted mesh, control plane, cone+symmetric NAT, gateways, MagicDNS, ACL, durable+rotatable auth, persistent sessions, self-healing nodes, and **clients for Linux, Android, macOS, and Windows with real data planes**. Linux is live; the desktop data planes are **runtime-verified on real macOS/Windows runners**; Android is self-serve. The only unverified path is full end-to-end traffic between two physical desktop machines (and the on-device phone check) — every individual layer is proven.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
