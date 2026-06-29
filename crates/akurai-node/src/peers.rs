@@ -101,6 +101,9 @@ impl PeerTable {
 
     /// Every (subnet, gateway-peer-overlay-IP) pair, for installing routes that
     /// point advertised subnets at the overlay interface.
+    // Consumed only by the Linux gateway path in `setup_interface`; the macOS
+    // client path and the Windows stub don't install per-peer subnet routes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn advertised_routes(&self) -> Vec<(Cidr, Ipv4Addr)> {
         self.by_ip
             .values()

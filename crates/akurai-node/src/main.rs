@@ -573,9 +573,13 @@ fn load_or_bootstrap_token(
     // Persist with 0600 permissions so future restarts skip the cookie round-trip.
     {
         use std::io::Write as IoWrite;
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.write(true).create(true).truncate(true);
+        // 0600 on Unix; on Windows the file inherits the user-profile ACL.
+        #[cfg(unix)]
+        opts.mode(0o600);
         if let Ok(mut f) = opts.open(token_path) {
             let _ = f.write_all(token.as_bytes());
             let _ = f.write_all(b"\n");

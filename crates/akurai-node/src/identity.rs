@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -41,9 +42,12 @@ impl Identity {
         if let Some(parent) = key_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Private key: 0600, owner-only.
+        // Private key: owner-only (0600) on Unix; on Windows the file inherits the
+        // user-profile ACL (Unix mode bits don't exist there).
         let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
         {
             use std::io::Write;
             let mut f = opts.open(key_path)?;
@@ -96,6 +100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn private_key_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp("perms");

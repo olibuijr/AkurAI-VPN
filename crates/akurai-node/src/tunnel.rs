@@ -22,9 +22,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
+// Interface/route setup shells out to the OS CLI on Linux and macOS; the Windows
+// TUN path is a stub, so `Command` is unused there.
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -39,6 +42,11 @@ use crate::acl::Acl;
 use crate::peers::PeerTable;
 
 /// Runtime configuration for the data-plane daemon.
+// Several fields drive interface/route setup, which is fully exercised only on the
+// Linux gateway path; the macOS client path uses a subset and the Windows stub none.
+// Suppress the resulting platform-specific dead-field warnings OFF Linux only, so
+// the Linux build is unaffected.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct TunnelConfig {
     pub iface: String,
     pub overlay_ip: Ipv4Addr,
@@ -93,7 +101,7 @@ type Table = HashMap<Ipv4Addr, PeerState>;
 /// are `Arc`s) so each pump takes a single context argument.
 #[derive(Clone)]
 struct Pump {
-    tun: Arc<File>,
+    tun: Arc<akurai_sys::TunDevice>,
     sock: Arc<UdpSocket>,
     table: Arc<Mutex<Table>>,
     peers: Arc<RwLock<Arc<PeerTable>>>,
@@ -119,10 +127,16 @@ fn parse_addr(payload: &[u8]) -> Option<SocketAddr> {
     Some(SocketAddr::from((ip, port)))
 }
 
-/// Bring up the overlay interface: address, MTU, the overlay-only route, any
-/// peer-advertised subnet routes, and IP forwarding if this node is a gateway.
+/// Bring up the overlay interface. Platform-specific: Linux uses `ip`/`sysctl`,
+/// macOS uses `ifconfig`/`route`, Windows is a no-op (TUN is stubbed). `iface` is
+/// the REAL interface name (the requested name on Linux, the kernel-assigned
+/// `utunN` on macOS). NO default route is ever installed.
+///
+/// Bring up the overlay interface on Linux: address, MTU, the overlay-only route,
+/// any peer-advertised subnet routes, and IP forwarding if this node is a gateway.
 /// Uses `ip`/`sysctl` (safe `std::process::Command`); adds NO default route.
-fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+fn setup_interface(cfg: &TunnelConfig, iface: &str) -> io::Result<()> {
     let ip = |args: &[&str]| -> io::Result<()> {
         let status = Command::new("ip").args(args).status()?;
         if !status.success() {
@@ -132,11 +146,11 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     };
     let addr = format!("{}/32", cfg.overlay_ip);
     let mtu = cfg.mtu.to_string();
-    ip(&["addr", "add", &addr, "dev", &cfg.iface])?;
-    ip(&["link", "set", &cfg.iface, "mtu", &mtu])?;
-    ip(&["link", "set", &cfg.iface, "up"])?;
+    ip(&["addr", "add", &addr, "dev", iface])?;
+    ip(&["link", "set", iface, "mtu", &mtu])?;
+    ip(&["link", "set", iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
-    ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
+    ip(&["route", "add", &cfg.overlay_cidr, "dev", iface])?;
     // IPv6 overlay address + route (fd88::/48), derived from the node\'s index
     // (100.88.0.N ↔ fd88::N). Best-effort — IPv6 may be disabled on the host.
     let idx6 = u32::from(cfg.overlay_ip).wrapping_sub(u32::from(akurai_common::OVERLAY_IPV4_NET));
@@ -148,7 +162,7 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
             "add",
             &format!("{ip6}/{}", akurai_common::OVERLAY_IPV6_PREFIX_LEN),
             "dev",
-            &cfg.iface,
+            iface,
         ])
         .status();
     let _ = Command::new("ip")
@@ -162,7 +176,7 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
                 akurai_common::OVERLAY_IPV6_PREFIX_LEN
             ),
             "dev",
-            &cfg.iface,
+            iface,
         ])
         .status();
     // Subnet routes: point each peer-advertised subnet at the overlay. A
@@ -174,7 +188,7 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
         }
         let cidr = subnet.to_string();
         let _ = Command::new("ip")
-            .args(["route", "add", &cidr, "dev", &cfg.iface])
+            .args(["route", "add", &cidr, "dev", iface])
             .status();
     }
     // Exit node (full-tunnel), EXPLICIT opt-in only: route everything via the
@@ -182,15 +196,12 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     // deleting it — so when the tunnel/TUN closes, normal routing is restored
     // automatically. The chosen exit peer must advertise 0.0.0.0/0.
     if let Some(exit) = cfg.exit_node {
-        eprintln!(
-            "{}: full-tunnel — routing 0.0.0.0/0 via exit node {exit}",
-            cfg.iface
-        );
+        eprintln!("{iface}: full-tunnel — routing 0.0.0.0/0 via exit node {exit}");
         let _ = Command::new("ip")
-            .args(["route", "add", "0.0.0.0/1", "dev", &cfg.iface])
+            .args(["route", "add", "0.0.0.0/1", "dev", iface])
             .status();
         let _ = Command::new("ip")
-            .args(["route", "add", "128.0.0.0/1", "dev", &cfg.iface])
+            .args(["route", "add", "128.0.0.0/1", "dev", iface])
             .status();
     }
     // If THIS node is a gateway, enable IP forwarding. An exit gateway (advertising
@@ -212,11 +223,53 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Bring up the overlay interface on macOS: assign the overlay address as a
+/// point-to-point host address, set the MTU, bring it up, and add the overlay-only
+/// route over `utunN`. The Linux-only gateway bits (`sysctl`/`iptables`, IPv6,
+/// per-peer subnet routes) are intentionally omitted — this is the client path.
+/// NO default route is installed.
+#[cfg(target_os = "macos")]
+fn setup_interface(cfg: &TunnelConfig, iface: &str) -> io::Result<()> {
+    let ip = cfg.overlay_ip.to_string();
+    let status = Command::new("ifconfig")
+        .args([iface, &ip, &ip, "up"])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "`ifconfig {iface} {ip} {ip} up` failed"
+        )));
+    }
+    // Best-effort MTU (the macOS analogue of `ip link set <iface> mtu`).
+    let _ = Command::new("ifconfig")
+        .args([iface, "mtu", &cfg.mtu.to_string()])
+        .status();
+    // Overlay-scoped route ONLY. Never a default route.
+    let status = Command::new("route")
+        .args(["-n", "add", "-net", &cfg.overlay_cidr, "-interface", iface])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "`route -n add -net {} -interface {iface}` failed",
+            cfg.overlay_cidr
+        )));
+    }
+    Ok(())
+}
+
+/// Windows interface setup is a no-op while the TUN data plane is stubbed.
+#[cfg(target_os = "windows")]
+fn setup_interface(_cfg: &TunnelConfig, _iface: &str) -> io::Result<()> {
+    Ok(())
+}
+
 /// Run the data plane. Opens the TUN, brings up the interface, binds the socket,
 /// and blocks running the pumps until the process is killed.
 pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let tun = Arc::new(akurai_sys::create_tun(&cfg.iface)?);
-    setup_interface(&cfg)?;
+    // The REAL interface name: the requested name on Linux, the kernel-assigned
+    // `utunN` on macOS. Interface/route setup must target this, not `cfg.iface`.
+    let iface = tun.name().to_string();
+    setup_interface(&cfg, &iface)?;
 
     let sock = Arc::new(UdpSocket::bind(("0.0.0.0", 0))?);
     let relay = cfg.relay;
@@ -332,8 +385,7 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
     // Peers already logged as ACL-denied, so the drop notice prints once each.
     let mut acl_denied_logged: HashSet<Ipv4Addr> = HashSet::new();
     loop {
-        let mut tunref: &File = &tun;
-        let n = match tunref.read(&mut buf) {
+        let n = match tun.recv(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -508,8 +560,7 @@ fn udp_pump(pump: Pump) {
                     if let Some(sess) = st.session.as_mut() {
                         if let Some(pt) = sess.decrypt(&frame.payload) {
                             drop(t);
-                            let mut tunref: &File = &tun;
-                            let _ = tunref.write_all(&pt);
+                            let _ = tun.send(&pt);
                         }
                     }
                 }
