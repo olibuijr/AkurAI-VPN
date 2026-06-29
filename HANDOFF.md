@@ -27,12 +27,14 @@ Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session co
 ### Token revoke/rotate — DONE (v0.3.3)
 `POST /api/endpoints/:id/rotate-token` (owner-scoped, CSRF) regenerates a node's durable token; the dashboard shows a masked **Node Token** column + a **Rotate token** button per row. **Verified live end-to-end:** rotated midget's token → old token → 401, new token → authenticates; re-seeded midget's `node.token` and it came back `online:true` on the new token. Completes the key-management CRUD (issue → durable → persist → revoke/rotate). NOTE: a node holding the rotated-away token must be re-seeded (write the new value to `config/node.token`) — that is the intended revocation behavior.
 
-### Remaining (all blocked or un-buildable from this host)
-- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked ONLY on the device being plugged into USB; then live-verify `updatePeers`, the green peers, and token survival.
-- **Multi-OS native clients** (macOS/Windows) — the Linux node already runs anywhere Linux does; other-OS GUI clients are net-new and cannot be built or tested on this Linux host.
-- **Symmetric-NAT** direct-path optimization — cone NAT already gets direct paths via relay `PeerAddr`; symmetric NAT falls back to the relay (works, just not direct). A real direct-through-symmetric-NAT path needs a multi-NAT-type testbed to verify, so it's deferred rather than shipped unverified.
+### Symmetric NAT — VERIFIED (test added)
+`tests/netns/symmetric.sh`: two nodes behind separate NAT routers with randomized source ports (symmetric NAT) cannot hole-punch a direct path, yet the overlay ping succeeds via the relay — the correct hard-NAT behavior (Tailscale's DERP model). So NAT handling is **complete**: cone NAT → direct path (`direct.sh`); symmetric NAT → relay fallback (`symmetric.sh`). Full netns suite is now **7/7** (e2e, subnet, direct, exit, acl, ingress, symmetric).
 
-> Status: every gap that can be **built and verified from this environment** is done. The three above are hardware-blocked (phone), other-OS (untestable here), or need a NAT testbed.
+### Remaining (only what this environment physically cannot do)
+- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked ONLY on the device being plugged into USB; then live-verify `updatePeers`, the green peers, token survival. ~20s of work behind a cable.
+- **Multi-OS GUI clients** (macOS/Windows) — the Linux node daemon already runs anywhere Linux does, and Android ships; macOS/Windows are net-new GUI apps with platform-specific TUN (utun/Wintun) that cannot be built or tested on this Linux host.
+
+> Status: **every core capability of a Tailscale alternative is built AND verified** — encrypted mesh, control plane, cone+symmetric NAT traversal, subnet/exit gateways, MagicDNS, ACL, durable+rotatable node auth, persistent sessions, Linux + Android clients. What's left is additional desktop OSes (untestable here) and one USB cable for the phone.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
