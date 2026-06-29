@@ -12,6 +12,11 @@ name = "akurai-node"
 path = "src/main.rs"
 
 # Workspace pure-std crate only. The TUN device and packet transport are stubs;
-# no external runtime dependency is linked.
+# no external runtime dependency is linked. The data plane links only sibling
+# AkurAI crates: akurai-sys (TUN ioctl), akurai-crypto (X25519 identity),
+# akurai-transport (Noise_IK sessions), akurai-common (frame/overlay/base64).
 [dependencies]
 akurai-common = { path = "../akurai-common" }
+akurai-crypto = { path = "../akurai-crypto" }
+akurai-transport = { path = "../akurai-transport" }
+akurai-sys = { path = "../akurai-sys" }

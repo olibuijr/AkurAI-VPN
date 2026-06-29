@@ -1,0 +1,15 @@
+[package]
+name = "akurai-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-dependency Linux system seam for AkurAI VPN: TUN device creation via a single isolated ioctl syscall. std only; all unsafe confined to the `raw` module."
+
+[lib]
+path = "src/lib.rs"
+
+# No [dependencies] — std only. The ONLY unsafe in the whole VPN data plane is
+# the TUNSETIFF ioctl in src/raw.rs; everything above it (packet I/O, interface
+# setup) is safe std (File / Command / UdpSocket).

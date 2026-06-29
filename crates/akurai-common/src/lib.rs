@@ -13,7 +13,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod b64;
 pub mod cidr;
+pub mod frame;
 pub mod ids;
 pub mod node;
 pub mod overlay;
@@ -21,6 +23,7 @@ pub mod policy;
 pub mod transport;
 
 pub use cidr::Cidr;
+pub use frame::{Frame, FrameKind};
 pub use ids::{MachineKey, NodeId};
 pub use node::{Endpoint, NodeDescriptor};
 pub use overlay::{

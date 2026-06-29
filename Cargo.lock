@@ -36,10 +36,20 @@ name = "akurai-node"
 version = "0.0.9"
 dependencies = [
  "akurai-common",
+ "akurai-crypto",
+ "akurai-sys",
+ "akurai-transport",
 ]
 
 [[package]]
 name = "akurai-relay"
+version = "0.0.9"
+dependencies = [
+ "akurai-common",
+]
+
+[[package]]
+name = "akurai-sys"
 version = "0.0.9"
 
 [[package]]

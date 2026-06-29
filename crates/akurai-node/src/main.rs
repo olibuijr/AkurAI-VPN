@@ -6,11 +6,15 @@
 //! parsed from `std::env::args` by hand to keep the zero-dependency promise.
 
 mod error;
+mod identity;
 mod peermap;
+mod peers;
 mod tun;
+mod tunnel;
 
 use std::fs;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -38,6 +42,7 @@ fn run(args: &[String]) -> Result<(), NodeError> {
         }
         Some("install") => install(&args[1..]),
         Some("up") => up(&args[1..]),
+        Some("tunnel") => tunnel_cmd(&args[1..]),
         Some("down") => down(),
         Some("status") => status(&args[1..]),
         Some("path") => {
@@ -82,10 +87,18 @@ fn install(args: &[String]) -> Result<(), NodeError> {
     }
     write_state(&dirs, "installed")?;
 
+    // Generate (or keep) this node's X25519 identity. The public key is what the
+    // control plane records and peers use to open a session to us.
+    let id = identity::Identity::load_or_create(
+        &dirs.config.join("identity.key"),
+        &dirs.config.join("identity.pub"),
+    )?;
+
     println!("installed {NAME} {VERSION}");
     println!("  home : {}", dirs.home.display());
     println!("  bin  : {}", installed_exe.display());
     println!("  mode : host-only (routing disabled)");
+    println!("  id   : {}", id.public_b64());
     Ok(())
 }
 
@@ -107,6 +120,75 @@ fn up(args: &[String]) -> Result<(), NodeError> {
     println!("  home    : {}", dirs.home.display());
     println!("  overlay : {}", read_overlay(&dirs));
     println!("  routing : disabled");
+    Ok(())
+}
+
+/// Run the data-plane daemon: bring up `akurai0`, connect to the relay, and pump
+/// encrypted overlay traffic until killed. Blocks. Requires CAP_NET_ADMIN.
+///
+/// Flags: `--overlay-ip <ip>` (required), `--relay <host:port>` (required),
+/// `--peers <file>` (default `<home>/config/peers`), `--iface <name>`
+/// (default `akurai0`), `--mtu <n>` (default overlay MTU).
+fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
+    let dirs = NodeDirs::new(node_home(args)?);
+    dirs.create()?;
+    let id = identity::Identity::load_or_create(
+        &dirs.config.join("identity.key"),
+        &dirs.config.join("identity.pub"),
+    )?;
+
+    let iface = arg_value(args, "--iface").unwrap_or("akurai0").to_string();
+    let overlay_ip: Ipv4Addr = arg_value(args, "--overlay-ip")
+        .ok_or_else(|| NodeError::Usage("tunnel requires --overlay-ip <ip>".to_string()))?
+        .parse()
+        .map_err(|_| NodeError::Usage("invalid --overlay-ip".to_string()))?;
+    let relay: SocketAddr = arg_value(args, "--relay")
+        .ok_or_else(|| NodeError::Usage("tunnel requires --relay <host:port>".to_string()))?
+        .parse()
+        .map_err(|_| NodeError::Usage("invalid --relay (want host:port)".to_string()))?;
+    let mtu: u16 = arg_value(args, "--mtu")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(akurai_common::OVERLAY_MTU);
+    let peers_path = arg_value(args, "--peers")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.config.join("peers"));
+    // Source the peer map from the control plane (`--control <url>`, fetched via
+    // curl with the saved cookie jar) when available, else the static file.
+    let peers = match arg_value(args, "--control") {
+        Some(url) => {
+            let fetched = peers::PeerTable::fetch(url, &dirs.config.join("cookies.txt"));
+            if fetched.is_empty() {
+                peers::PeerTable::load_file(&peers_path)
+            } else {
+                fetched
+            }
+        }
+        None => peers::PeerTable::load_file(&peers_path),
+    };
+    if peers.is_empty() {
+        eprintln!("{NAME}: warning — no peers loaded; the tunnel reaches nothing until a peer map is available");
+    }
+
+    let overlay_cidr = format!(
+        "{}/{}",
+        akurai_common::OVERLAY_IPV4_NET,
+        akurai_common::OVERLAY_IPV4_PREFIX_LEN
+    );
+    eprintln!(
+        "{NAME}: tunnel up — overlay {overlay_ip} on {iface}, relay {relay}, {} peer(s), id {}",
+        peers.len(),
+        id.public_b64()
+    );
+    let cfg = tunnel::TunnelConfig {
+        iface,
+        overlay_ip,
+        overlay_cidr,
+        mtu,
+        relay,
+        keypair: id.keypair,
+        peers,
+    };
+    tunnel::run(cfg)?;
     Ok(())
 }
 

@@ -1,0 +1,195 @@
+//! The peer table — who this node may reach over the overlay.
+//!
+//! A peer is an overlay IPv4 plus the X25519 public key needed to open a
+//! Noise_IK session to it. The table is loaded from one of two sources:
+//!
+//! - a static `config/peers` file (`<overlay_ip> <pubkey_b64> <name>` per line) —
+//!   used for tests and offline bring-up, and
+//! - the control plane's `GET /api/peermap`, fetched via `curl` (pure-std has no
+//!   TLS client; the node already shells to `ip`, so `curl` is consistent).
+//!
+//! Fail-closed: a line/peer that does not parse is skipped, and a packet to a
+//! destination not in the table is dropped by the data plane.
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::path::Path;
+use std::process::Command;
+
+use akurai_common::b64;
+
+/// One reachable overlay peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub overlay_ip: Ipv4Addr,
+    pub public_key: [u8; 32],
+    pub name: String,
+}
+
+/// Overlay-IP-indexed peer table.
+#[derive(Debug, Clone, Default)]
+pub struct PeerTable {
+    by_ip: HashMap<Ipv4Addr, Peer>,
+}
+
+impl PeerTable {
+    pub fn from_peers(peers: Vec<Peer>) -> Self {
+        let mut by_ip = HashMap::new();
+        for p in peers {
+            by_ip.insert(p.overlay_ip, p);
+        }
+        Self { by_ip }
+    }
+
+    pub fn get(&self, ip: &Ipv4Addr) -> Option<&Peer> {
+        self.by_ip.get(ip)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_ip.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_ip.is_empty()
+    }
+
+    /// Load from a static `peers` file. Missing file ⇒ empty table (not an error).
+    pub fn load_file(path: &Path) -> Self {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        Self::from_peers(parse_peers_file(&content))
+    }
+
+    /// Fetch from the control plane's `/api/peermap` via `curl` with the saved
+    /// session cookie jar. Returns an empty table on any curl/parse failure (the
+    /// caller decides whether to fall back to the static file).
+    pub fn fetch(control_url: &str, cookie_jar: &Path) -> Self {
+        let out = Command::new("curl")
+            .args([
+                "-fsSL",
+                "-b",
+                &cookie_jar.to_string_lossy(),
+                &format!("{}/api/peermap", control_url.trim_end_matches('/')),
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                Self::from_peers(parse_peermap_json(&String::from_utf8_lossy(&o.stdout)))
+            }
+            _ => Self::default(),
+        }
+    }
+}
+
+/// Parse a static peers file: one `<overlay_ip> <pubkey_b64> [name]` per line.
+/// Blank lines and `#` comments are ignored; unparseable lines are skipped.
+pub fn parse_peers_file(content: &str) -> Vec<Peer> {
+    let mut peers = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(ip_s), Some(pk_s)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let name = parts.next().unwrap_or("").to_string();
+        if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(pk_s)) {
+            peers.push(Peer {
+                overlay_ip: ip,
+                public_key: pk,
+                name,
+            });
+        }
+    }
+    peers
+}
+
+/// Parse the control plane's peer-map JSON array
+/// (`[{"overlay_ipv4":"..","public_key":"..","name":"..","online":..}]`).
+/// Hand-rolled, dependency-free; skips malformed objects.
+pub fn parse_peermap_json(json: &str) -> Vec<Peer> {
+    let mut peers = Vec::new();
+    // Each object is delimited by braces; split conservatively on '}'.
+    for obj in json.split('}') {
+        let (Some(ip_s), Some(pk_s)) = (
+            json_str_field(obj, "overlay_ipv4"),
+            json_str_field(obj, "public_key"),
+        ) else {
+            continue;
+        };
+        let name = json_str_field(obj, "name").unwrap_or_default();
+        if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(&pk_s)) {
+            peers.push(Peer {
+                overlay_ip: ip,
+                public_key: pk,
+                name,
+            });
+        }
+    }
+    peers
+}
+
+/// Extract a `"key":"value"` string field from a JSON fragment (no escapes in
+/// our values — overlay IPs, Base64, and names are escape-free).
+fn json_str_field(fragment: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = fragment.find(&needle)? + needle.len();
+    let rest = fragment[pos..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pk(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn parses_static_peers_file() {
+        let pk_b64 = b64::encode(&pk(7));
+        let content =
+            format!("# a comment\n100.88.0.3 {pk_b64} laptop\n\n100.88.0.4 {pk_b64}\nbogus line\n");
+        let peers = parse_peers_file(&content);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].overlay_ip, Ipv4Addr::new(100, 88, 0, 3));
+        assert_eq!(peers[0].public_key, pk(7));
+        assert_eq!(peers[0].name, "laptop");
+        assert_eq!(peers[1].name, ""); // name optional
+    }
+
+    #[test]
+    fn skips_unparseable_lines() {
+        let peers = parse_peers_file("not-an-ip badkey\n999.999.999.999 x\n");
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn parses_control_peermap_json() {
+        let pk_b64 = b64::encode(&pk(9));
+        let json = format!(
+            "[{{\"overlay_ipv4\":\"100.88.0.5\",\"public_key\":\"{pk_b64}\",\"name\":\"phone\",\"online\":true}}]"
+        );
+        let peers = parse_peermap_json(&json);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].overlay_ip, Ipv4Addr::new(100, 88, 0, 5));
+        assert_eq!(peers[0].public_key, pk(9));
+        assert_eq!(peers[0].name, "phone");
+    }
+
+    #[test]
+    fn table_lookup_by_ip() {
+        let t = PeerTable::from_peers(vec![Peer {
+            overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
+            public_key: pk(1),
+            name: "b".into(),
+        }]);
+        assert!(t.get(&Ipv4Addr::new(100, 88, 0, 3)).is_some());
+        assert!(t.get(&Ipv4Addr::new(100, 88, 0, 9)).is_none());
+    }
+}

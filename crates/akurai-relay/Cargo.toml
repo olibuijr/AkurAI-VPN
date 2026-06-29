@@ -11,5 +11,8 @@ description = "AkurAI VPN relay: ciphertext-only packet forwarding fallback (0.0
 name = "akurai-relay"
 path = "src/main.rs"
 
-# Pure std, zero dependencies. The relay only forwards opaque ciphertext; it
-# never holds payload keys and links no crypto crate.
+# Pure std. The relay only forwards opaque ciphertext; it links no crypto crate
+# and holds no payload keys. It depends on akurai-common solely for the frame
+# envelope codec (which carries no keys).
+[dependencies]
+akurai-common = { path = "../akurai-common" }

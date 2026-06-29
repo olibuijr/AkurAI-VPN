@@ -50,7 +50,7 @@ fn print_usage() {
     println!("    {NAME} <command>");
     println!();
     println!("COMMANDS:");
-    println!("    serve      Start the relay forward loop (not implemented in 0.0.1)");
+    println!("    serve      Start the ciphertext-only forward loop on RELAY_PORT (default 51820)");
     println!("    version    Print version and exit");
     println!("    help       Show this help");
 }
