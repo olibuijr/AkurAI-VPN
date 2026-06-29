@@ -79,6 +79,27 @@ fn forward_one(
         Some(dest_addr) => {
             let _ = sock.send_to(datagram, dest_addr);
             stats.forwarded.fetch_add(1, Ordering::Relaxed);
+            // Direct-path discovery: during a handshake, tell each end where the
+            // other is, so they can try a direct UDP path and stop using the hub.
+            if matches!(
+                frame.kind,
+                FrameKind::HandshakeInit | FrameKind::HandshakeResp
+            ) {
+                if let Some(b) = sockaddr_v4_bytes(from) {
+                    if let Some(f) =
+                        Frame::new(FrameKind::PeerAddr, frame.src, frame.dest, b.to_vec())
+                    {
+                        let _ = sock.send_to(&f.encode(), dest_addr); // tell dest about src
+                    }
+                }
+                if let Some(b) = sockaddr_v4_bytes(dest_addr) {
+                    if let Some(f) =
+                        Frame::new(FrameKind::PeerAddr, frame.dest, frame.src, b.to_vec())
+                    {
+                        let _ = sock.send_to(&f.encode(), from); // tell src about dest
+                    }
+                }
+            }
             Action::Forwarded {
                 dest: frame.dest,
                 to: dest_addr,
@@ -88,6 +109,20 @@ fn forward_one(
             stats.dropped_unknown.fetch_add(1, Ordering::Relaxed);
             Action::DroppedUnknown(frame.dest)
         }
+    }
+}
+
+/// Encode an IPv4 socket address as 6 bytes (4 octets + BE port) for a
+/// `PeerAddr` payload. Returns `None` for IPv6 (the overlay underlay is v4).
+fn sockaddr_v4_bytes(a: SocketAddr) -> Option<[u8; 6]> {
+    match a {
+        SocketAddr::V4(v4) => {
+            let mut b = [0u8; 6];
+            b[..4].copy_from_slice(&v4.ip().octets());
+            b[4..].copy_from_slice(&v4.port().to_be_bytes());
+            Some(b)
+        }
+        SocketAddr::V6(_) => None,
     }
 }
 

@@ -1,21 +1,25 @@
-//! The data plane — a hub-routed encrypted overlay pump.
+//! The data plane — an encrypted overlay pump with relay fallback and direct paths.
 //!
 //! `run` opens the `akurai0` TUN, assigns the node's overlay IP and a
 //! `100.88.0.0/16`-ONLY route (never a default route — the host's internet path
-//! is inviolable), connects a UDP socket to the relay, and runs two blocking
-//! pumps that share a per-peer session table:
+//! is inviolable), binds a UDP socket, and runs two blocking pumps over a shared
+//! per-peer state table:
 //!
-//! - **TUN → UDP**: read an IPv4 packet, look up the destination peer, encrypt
-//!   with its Noise session (initiating a handshake if none exists), and send a
-//!   `Data` frame to the relay, which forwards it to the peer.
-//! - **UDP → TUN**: receive a relay frame; complete handshakes (`HandshakeInit`
-//!   / `HandshakeResp`) or decrypt a `Data` frame and write the inner packet to
-//!   the TUN.
+//! - **TUN → UDP**: read an IPv4 packet, route it to the carrying peer, encrypt
+//!   with that peer's Noise session, and send a `Data` frame on the peer's
+//!   current path — a **direct** UDP address once one is confirmed, otherwise the
+//!   relay (which forwards by destination overlay IP).
+//! - **UDP → TUN**: receive a frame; complete handshakes, learn/confirm direct
+//!   paths from `PeerAddr` hints, or decrypt a `Data` frame and write the inner
+//!   packet to the TUN.
 //!
-//! End-to-end: the relay only ever forwards ciphertext. Fail-closed: a packet to
-//! an unknown destination, or from an unverified peer, is dropped.
+//! Direct paths (MVP3): handshakes go via the relay, which sends each end a
+//! `PeerAddr` hint with the other's observed UDP address. Both nodes probe that
+//! address (opening any NAT hole); a frame received straight from a peer confirms
+//! the direct path and traffic leaves the hub. If no direct path forms, the relay
+//! carries everything. End-to-end: the relay only ever sees ciphertext.
+//! Fail-closed: a packet to an unknown destination, or from an unverified peer, is dropped.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -46,14 +50,21 @@ pub struct TunnelConfig {
     pub advertise: Vec<akurai_common::Cidr>,
 }
 
-/// Per-peer Noise session state, shared between the two pump threads.
+/// Per-peer session + path state, shared between the pump threads.
 #[derive(Default)]
-struct SessionTable {
-    /// Completed sessions keyed by the peer's overlay IP.
-    established: HashMap<Ipv4Addr, Session>,
-    /// Handshakes we initiated and are awaiting a response for.
-    pending: HashMap<Ipv4Addr, Initiator>,
+struct PeerState {
+    /// Completed Noise session (None until the handshake finishes).
+    session: Option<Session>,
+    /// In-flight handshake we initiated.
+    pending: Option<Initiator>,
+    /// A confirmed direct UDP path — outbound frames go here instead of the relay.
+    direct: Option<SocketAddr>,
+    /// A direct address learned from a relay `PeerAddr` hint, being probed but
+    /// not yet confirmed.
+    candidate: Option<SocketAddr>,
 }
+
+type Table = HashMap<Ipv4Addr, PeerState>;
 
 /// 32 bytes of OS entropy for an ephemeral handshake secret.
 fn rand32() -> io::Result<[u8; 32]> {
@@ -62,8 +73,19 @@ fn rand32() -> io::Result<[u8; 32]> {
     Ok(b)
 }
 
-/// Bring up the overlay interface with the node's address and the overlay-only
-/// route. Uses `ip` (safe `std::process::Command`); adds NO default route.
+/// Decode a 6-byte `PeerAddr` payload (4 octets + BE port) into a socket address.
+fn parse_addr(payload: &[u8]) -> Option<SocketAddr> {
+    if payload.len() != 6 {
+        return None;
+    }
+    let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+    let port = u16::from_be_bytes([payload[4], payload[5]]);
+    Some(SocketAddr::from((ip, port)))
+}
+
+/// Bring up the overlay interface: address, MTU, the overlay-only route, any
+/// peer-advertised subnet routes, and IP forwarding if this node is a gateway.
+/// Uses `ip`/`sysctl` (safe `std::process::Command`); adds NO default route.
 fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     let ip = |args: &[&str]| -> io::Result<()> {
         let status = Command::new("ip").args(args).status()?;
@@ -79,17 +101,15 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     ip(&["link", "set", &cfg.iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
     ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
-    // Subnet routes: point each peer-advertised subnet at the overlay so packets
-    // for it are tunnelled to the advertising gateway. Still NEVER 0.0.0.0/0.
+    // Subnet routes: point each peer-advertised subnet at the overlay. Still NEVER 0.0.0.0/0.
     for (subnet, _gw) in cfg.peers.advertised_routes() {
         let cidr = subnet.to_string();
-        // Best-effort: a subnet may already be routed; ignore an add failure.
         let _ = Command::new("ip")
             .args(["route", "add", &cidr, "dev", &cfg.iface])
             .status();
     }
-    // If THIS node is a subnet gateway, enable IP forwarding so it can relay
-    // overlay traffic onward to the real subnet behind it.
+    // If THIS node is a subnet gateway, enable IP forwarding to relay overlay
+    // traffic onward to the real subnet behind it.
     if !cfg.advertise.is_empty() {
         let _ = Command::new("sysctl")
             .args(["-qw", "net.ipv4.ip_forward=1"])
@@ -98,23 +118,21 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Run the data plane. Opens the TUN, brings up the interface, connects to the
-/// relay, and blocks running the two pumps until the process is killed.
+/// Run the data plane. Opens the TUN, brings up the interface, binds the socket,
+/// and blocks running the pumps until the process is killed.
 pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let tun = Arc::new(akurai_sys::create_tun(&cfg.iface)?);
     setup_interface(&cfg)?;
 
     let sock = Arc::new(UdpSocket::bind(("0.0.0.0", 0))?);
-    sock.connect(cfg.relay)?;
-
-    let sessions = Arc::new(Mutex::new(SessionTable::default()));
+    let relay = cfg.relay;
+    let table: Arc<Mutex<Table>> = Arc::new(Mutex::new(HashMap::new()));
     let peers = Arc::new(cfg.peers);
     let kp = Arc::new(cfg.keypair);
     let my_ip = cfg.overlay_ip;
 
     // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer's
-    // overlay IP, served on the node's own overlay IP:53. Point the system
-    // resolver at this address (e.g. `nameserver <overlay_ip>`) to `ping nodeb`.
+    // overlay IP, served on the node's own overlay IP:53.
     {
         let dns_peers = Arc::clone(&peers);
         let bind = SocketAddr::from((my_ip, 53));
@@ -123,45 +141,57 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
         });
     }
 
-    // Teach the relay our endpoint, and keep it (and any NAT mapping) fresh.
-    let keepalive_sock = Arc::clone(&sock);
-    let _keepalive = thread::spawn(move || loop {
-        if let Some(f) = Frame::new(
-            FrameKind::Keepalive,
-            my_ip,
-            Ipv4Addr::UNSPECIFIED,
-            Vec::new(),
-        ) {
-            let _ = keepalive_sock.send(&f.encode());
-        }
-        thread::sleep(Duration::from_secs(20));
-    });
+    // Keepalive to the relay (stay known) + probe direct candidates/paths to keep
+    // any NAT hole open.
+    {
+        let sock = Arc::clone(&sock);
+        let table = Arc::clone(&table);
+        thread::spawn(move || loop {
+            if let Some(f) = Frame::new(
+                FrameKind::Keepalive,
+                my_ip,
+                Ipv4Addr::UNSPECIFIED,
+                Vec::new(),
+            ) {
+                let bytes = f.encode();
+                let _ = sock.send_to(&bytes, relay);
+                if let Ok(t) = table.lock() {
+                    for st in t.values() {
+                        if let Some(a) = st.direct.or(st.candidate) {
+                            let _ = sock.send_to(&bytes, a);
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(15));
+        });
+    }
 
-    // UDP → TUN pump (handshakes + decrypt).
     let udp = {
         let tun = Arc::clone(&tun);
         let sock = Arc::clone(&sock);
-        let sessions = Arc::clone(&sessions);
+        let table = Arc::clone(&table);
         let peers = Arc::clone(&peers);
         let kp = Arc::clone(&kp);
-        thread::spawn(move || udp_pump(tun, sock, sessions, peers, kp, my_ip))
+        thread::spawn(move || udp_pump(tun, sock, table, peers, kp, my_ip, relay))
     };
 
-    // TUN → UDP pump (encrypt + initiate). Runs on this thread; blocks forever.
-    tun_pump(tun, sock, sessions, peers, kp, my_ip)?;
+    tun_pump(tun, sock, table, peers, kp, my_ip, relay)?;
     let _ = udp.join();
     Ok(())
 }
 
-/// Read packets from the TUN, encrypt to the destination peer (initiating a
-/// handshake on first contact), and send `Data` frames to the relay.
+/// Read packets from the TUN, encrypt to the routing peer (initiating a handshake
+/// via the relay on first contact), and send `Data` frames on the peer's current
+/// path (direct if confirmed, else the relay).
 fn tun_pump(
     tun: Arc<File>,
     sock: Arc<UdpSocket>,
-    sessions: Arc<Mutex<SessionTable>>,
+    table: Arc<Mutex<Table>>,
     peers: Arc<PeerTable>,
     kp: Arc<Keypair>,
     my_ip: Ipv4Addr,
+    relay: SocketAddr,
 ) -> io::Result<()> {
     let mut buf = [0u8; 2048];
     loop {
@@ -173,82 +203,114 @@ fn tun_pump(
             Err(e) => return Err(e),
         };
         let pkt = &buf[..n];
-        // IPv4 only (version nibble 4, ≥20-byte header).
         if n < 20 || (pkt[0] >> 4) != 4 {
-            continue;
+            continue; // IPv4 only
         }
         let dest = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
         // Route to the carrying peer: an exact overlay peer, or the gateway peer
-        // advertising the subnet `dest` falls in. The Noise session is keyed by
-        // the PEER's overlay IP (not the inner destination), so subnet traffic
-        // rides the gateway peer's session; the gateway forwards the inner packet.
+        // advertising the subnet `dest` falls in. The session is keyed by the
+        // PEER overlay IP, so subnet traffic rides the gateway peer's session.
         let Some(peer) = peers.route_to(&dest) else {
             continue; // fail-closed: no peer/route for this destination
         };
         let peer_ip = peer.overlay_ip;
         let peer_pub = peer.public_key;
 
-        // Decide what to emit while holding the lock; send after releasing it.
-        let mut to_send: Option<Vec<u8>> = None;
+        let mut out: Option<(Vec<u8>, SocketAddr)> = None;
         {
-            let mut tbl = sessions.lock().unwrap();
-            if let Some(sess) = tbl.established.get_mut(&peer_ip) {
+            let mut t = table.lock().unwrap();
+            let st = t.entry(peer_ip).or_default();
+            if let Some(sess) = st.session.as_mut() {
                 let ct = sess.encrypt(pkt);
-                to_send = Frame::new(FrameKind::Data, my_ip, peer_ip, ct).map(|f| f.encode());
-            } else if let Entry::Vacant(slot) = tbl.pending.entry(peer_ip) {
-                // First contact: initiate a handshake and drop this packet (the
-                // upper layer — ICMP/TCP — retransmits once we have a session).
+                let addr = st.direct.unwrap_or(relay);
+                out = Frame::new(FrameKind::Data, my_ip, peer_ip, ct).map(|f| (f.encode(), addr));
+            } else if st.pending.is_none() {
+                // First contact: initiate via the relay and drop this packet (the
+                // upper layer retransmits once a session exists).
                 if let Ok(eph) = rand32() {
                     let (state, msg1) = noise::initiate(&kp, &peer_pub, &eph);
-                    slot.insert(state);
-                    to_send = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1)
-                        .map(|f| f.encode());
+                    st.pending = Some(state);
+                    out = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1)
+                        .map(|f| (f.encode(), relay));
                 }
             }
         }
-        if let Some(bytes) = to_send {
-            let _ = sock.send(&bytes);
+        if let Some((bytes, addr)) = out {
+            let _ = sock.send_to(&bytes, addr);
         }
     }
 }
 
-/// Receive relay frames: complete handshakes, or decrypt `Data` and write the
-/// inner packet to the TUN. Survives malformed datagrams (logs nothing, continues).
+/// Receive frames: confirm direct paths, complete handshakes, act on `PeerAddr`
+/// hints, or decrypt `Data` and write the inner packet to the TUN. Survives
+/// malformed datagrams (continues).
 fn udp_pump(
     tun: Arc<File>,
     sock: Arc<UdpSocket>,
-    sessions: Arc<Mutex<SessionTable>>,
+    table: Arc<Mutex<Table>>,
     peers: Arc<PeerTable>,
     kp: Arc<Keypair>,
     my_ip: Ipv4Addr,
+    relay: SocketAddr,
 ) {
     let mut buf = [0u8; 4096];
     loop {
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
         let Some(frame) = Frame::decode(&buf[..n]) else {
-            continue; // malformed datagram dropped
+            continue;
         };
+
+        // A frame arriving straight from a known peer (not the relay) proves a
+        // working direct path — switch this peer's outbound path to it.
+        if from != relay && frame.kind != FrameKind::PeerAddr && peers.get(&frame.src).is_some() {
+            if let Ok(mut t) = table.lock() {
+                let st = t.entry(frame.src).or_default();
+                if st.direct.is_none() {
+                    eprintln!("akurai-node: direct path to {} via {from}", frame.src);
+                }
+                st.direct = Some(from);
+            }
+        }
+
         match frame.kind {
+            FrameKind::PeerAddr => {
+                // The relay hints that peer `frame.src` is reachable at the payload
+                // address. Remember it and probe to open any NAT hole.
+                if let (Some(addr), true) =
+                    (parse_addr(&frame.payload), peers.get(&frame.src).is_some())
+                {
+                    {
+                        let mut t = table.lock().unwrap();
+                        let st = t.entry(frame.src).or_default();
+                        if st.direct.is_none() {
+                            st.candidate = Some(addr);
+                        }
+                    }
+                    if let Some(f) = Frame::new(
+                        FrameKind::Keepalive,
+                        my_ip,
+                        Ipv4Addr::UNSPECIFIED,
+                        Vec::new(),
+                    ) {
+                        let _ = sock.send_to(&f.encode(), addr);
+                    }
+                }
+            }
             FrameKind::HandshakeInit => {
-                // A peer wants to reach us. Respond only if we can authenticate
-                // the initiator's static key against our peer table (fail-closed).
                 let Ok(eph) = rand32() else { continue };
                 if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
                     match peers.get(&frame.src) {
                         Some(p) if p.public_key == init_pub => {
-                            sessions
-                                .lock()
-                                .unwrap()
-                                .established
-                                .insert(frame.src, Session::new(keys));
+                            table.lock().unwrap().entry(frame.src).or_default().session =
+                                Some(Session::new(keys));
                             if let Some(reply) =
                                 Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
                             {
-                                let _ = sock.send(&reply.encode());
+                                let _ = sock.send_to(&reply.encode(), from); // reply on arrival path
                             }
                         }
                         _ => {} // unknown / mismatched peer: drop
@@ -256,24 +318,27 @@ fn udp_pump(
                 }
             }
             FrameKind::HandshakeResp => {
-                let mut tbl = sessions.lock().unwrap();
-                if let Some(state) = tbl.pending.remove(&frame.src) {
+                let mut t = table.lock().unwrap();
+                let st = t.entry(frame.src).or_default();
+                if let Some(state) = st.pending.take() {
                     if let Some(keys) = noise::finalize(state, &frame.payload) {
-                        tbl.established.insert(frame.src, Session::new(keys));
+                        st.session = Some(Session::new(keys));
                     }
                 }
             }
             FrameKind::Data => {
-                let mut tbl = sessions.lock().unwrap();
-                if let Some(sess) = tbl.established.get_mut(&frame.src) {
-                    if let Some(pt) = sess.decrypt(&frame.payload) {
-                        drop(tbl);
-                        let mut tunref: &File = &tun;
-                        let _ = tunref.write_all(&pt);
+                let mut t = table.lock().unwrap();
+                if let Some(st) = t.get_mut(&frame.src) {
+                    if let Some(sess) = st.session.as_mut() {
+                        if let Some(pt) = sess.decrypt(&frame.payload) {
+                            drop(t);
+                            let mut tunref: &File = &tun;
+                            let _ = tunref.write_all(&pt);
+                        }
                     }
                 }
             }
-            FrameKind::Keepalive => {} // nodes ignore; only the relay learns from these
+            FrameKind::Keepalive => {} // direct-path confirmation handled above
         }
     }
 }

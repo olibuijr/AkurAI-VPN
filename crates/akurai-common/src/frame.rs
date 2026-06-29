@@ -40,6 +40,9 @@ pub enum FrameKind {
     HandshakeResp,
     /// An end-to-end-encrypted inner IP packet (ciphertext to the relay).
     Data,
+    /// Relay→node hint: "peer `src` is reachable at the socket address in the
+    /// payload" (4-byte IPv4 + 2-byte BE port). Enables direct-path discovery.
+    PeerAddr,
 }
 
 impl FrameKind {
@@ -49,6 +52,7 @@ impl FrameKind {
             FrameKind::HandshakeInit => 2,
             FrameKind::HandshakeResp => 3,
             FrameKind::Data => 4,
+            FrameKind::PeerAddr => 5,
         }
     }
 
@@ -58,6 +62,7 @@ impl FrameKind {
             2 => Some(FrameKind::HandshakeInit),
             3 => Some(FrameKind::HandshakeResp),
             4 => Some(FrameKind::Data),
+            5 => Some(FrameKind::PeerAddr),
             _ => None,
         }
     }
