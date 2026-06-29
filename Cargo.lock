@@ -4,47 +4,47 @@ version = 4
 
 [[package]]
 name = "akurai-admin"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-common"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "akurai-control"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-crypto"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "akurai-dns"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-node"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akurai-common",
 ]
 
 [[package]]
 name = "akurai-relay"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "akurai-transport"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akurai-crypto",
 ]
