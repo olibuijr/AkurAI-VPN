@@ -367,6 +367,15 @@ fn route(req: &Request, state: &SharedState) -> Response {
                 .trim_end_matches("/delete");
             delete_endpoint(id, &user, req, state)
         }
+        (Method::Post, p) if p.starts_with("/api/endpoints/") && p.ends_with("/rotate-token") => {
+            let Some(user) = require_auth(req, state) else {
+                return Response::redirect("/login");
+            };
+            let id = p
+                .trim_start_matches("/api/endpoints/")
+                .trim_end_matches("/rotate-token");
+            rotate_token(id, &user, req, state)
+        }
         (Method::Delete, p) if p.starts_with("/api/endpoints/") => {
             let Some(user) = require_auth(req, state) else {
                 return Response::redirect("/login");
@@ -729,6 +738,31 @@ fn delete_endpoint(
     Response::redirect("/dashboard")
 }
 
+/// Rotate (revoke + reissue) the durable node token for one of the caller's own
+/// endpoints. The old token stops authenticating immediately; the node must be
+/// re-seeded with the new one. Owner-scoped + CSRF-protected like delete.
+fn rotate_token(id: &str, session: &AuthSession, req: &Request, state: &SharedState) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::bad_request("invalid csrf token");
+    }
+    let mut st = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    let Some(ep) = st
+        .endpoints
+        .iter_mut()
+        .find(|e| e.id == id && e.added_by == session.user.email)
+    else {
+        return Response::not_found();
+    };
+    ep.node_token = crate::vpn_endpoint::generate_node_token();
+    if let Err(e) = crate::vpn_endpoint::save(&st.endpoints) {
+        eprintln!("{NAME}: failed to persist endpoints after token rotation: {e}");
+    }
+    Response::redirect("/dashboard")
+}
+
 // ---------------------------------------------------------------------------
 // Auth helper
 // ---------------------------------------------------------------------------
@@ -880,6 +914,13 @@ fn render_dashboard(
                 } else {
                     e.public_key.clone()
                 };
+                let token_short = if e.node_token.len() > 14 {
+                    format!("{}…", &e.node_token[..14])
+                } else if e.node_token.is_empty() {
+                    "—".to_string()
+                } else {
+                    e.node_token.clone()
+                };
                 let ips = e.allowed_ips.join(", ");
                 let ep_disp = if e.endpoint_addr.is_empty() {
                     "—".to_string()
@@ -896,7 +937,12 @@ fn render_dashboard(
                      <td class=\"code\">Overlay IP: {overlay}</td>\
                      <td>{ips}</td>\
                      <td>{by}</td>\
+                     <td class=\"code\" title=\"{token_full}\">{token_short}</td>\
                      <td>\
+                       <form method=\"POST\" action=\"/api/endpoints/{id}/rotate-token\" style=\"margin:0 0 4px 0\">\
+                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
+                         <button type=\"submit\" class=\"btn\">Rotate token</button>\
+                       </form>\
                        <form method=\"POST\" action=\"/api/endpoints/{id}/delete\" style=\"margin:0\">\
                          <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
                          <button type=\"submit\" class=\"btn btn-danger\">Delete</button>\
@@ -910,6 +956,8 @@ fn render_dashboard(
                     overlay = html_esc(&overlay),
                     ips = html_esc(&ips),
                     by = html_esc(&e.added_by),
+                    token_full = html_esc(&e.node_token),
+                    token_short = html_esc(&token_short),
                     id = html_esc(&e.id),
                     csrf = html_esc(csrf_token),
                 )
@@ -919,7 +967,7 @@ fn render_dashboard(
             "<table>\
              <thead><tr>\
                <th>Name</th><th>Public Key</th><th>Endpoint</th>\
-               <th>Overlay IP</th><th>Allowed IPs</th><th>Added By</th><th></th>\
+               <th>Overlay IP</th><th>Allowed IPs</th><th>Added By</th><th>Node Token</th><th></th>\
              </tr></thead>\
              <tbody>{rows}</tbody>\
              </table>"
@@ -1165,6 +1213,40 @@ mod tests {
         let response = delete_endpoint("other", &session, &req, &state);
         assert_eq!(response.status, "404 Not Found");
         assert_eq!(state.lock().unwrap().endpoints.len(), 1);
+    }
+
+    #[test]
+    fn rotate_token_reissues_for_owned_node_and_rejects_others() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            let mut mine = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            mine.node_token = "aknk_old".to_string();
+            st.endpoints.push(mine);
+            st.endpoints
+                .push(ep("other", "other@example.com", &["100.88.0.3/32"]));
+        }
+        let session = session_for("user@example.com");
+        let req = request(&[], "csrf_token=csrf");
+
+        // Owner can rotate: token changes to a fresh aknk_ value.
+        let resp = rotate_token("mine", &session, &req, &state);
+        assert_eq!(resp.status, "302 Found");
+        let new_tok = state
+            .lock()
+            .unwrap()
+            .endpoints
+            .iter()
+            .find(|e| e.id == "mine")
+            .unwrap()
+            .node_token
+            .clone();
+        assert_ne!(new_tok, "aknk_old");
+        assert!(new_tok.starts_with("aknk_"));
+
+        // Cannot rotate another user's node.
+        let resp = rotate_token("other", &session, &req, &state);
+        assert_eq!(resp.status, "404 Not Found");
     }
 
     // -- peer map + heartbeat ------------------------------------------------
