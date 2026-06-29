@@ -62,6 +62,20 @@ impl PeerTable {
             .find(|p| p.advertised.iter().any(|c| c.contains(IpAddr::V4(*dest))))
     }
 
+    /// Resolve any destination IP (v4 or v6) to the carrying peer. The IPv6
+    /// overlay address of a peer is derived from its overlay-IPv4 host index
+    /// (so `100.88.0.2` ↔ `fd88::2`) — sessions stay keyed by the IPv4 overlay IP.
+    pub fn route_to_ip(&self, dest: IpAddr) -> Option<&Peer> {
+        match dest {
+            IpAddr::V4(v4) => self.route_to(&v4),
+            IpAddr::V6(v6) => self.by_ip.values().find(|p| {
+                let idx = u32::from(p.overlay_ip)
+                    .wrapping_sub(u32::from(akurai_common::OVERLAY_IPV4_NET));
+                akurai_common::OverlayIpv6::from_index(idx as u64).addr() == v6
+            }),
+        }
+    }
+
     /// Resolve a peer NAME (case-insensitive) to its overlay IP — MagicDNS.
     pub fn resolve_name(&self, name: &str) -> Option<Ipv4Addr> {
         let want = name.trim().to_ascii_lowercase();

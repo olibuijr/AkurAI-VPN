@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -104,6 +104,34 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     ip(&["link", "set", &cfg.iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
     ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
+    // IPv6 overlay address + route (fd88::/48), derived from the node's index
+    // (100.88.0.N ↔ fd88::N). Best-effort — IPv6 may be disabled on the host.
+    let idx6 = u32::from(cfg.overlay_ip).wrapping_sub(u32::from(akurai_common::OVERLAY_IPV4_NET));
+    let ip6 = akurai_common::OverlayIpv6::from_index(idx6 as u64).addr();
+    let _ = Command::new("ip")
+        .args([
+            "-6",
+            "addr",
+            "add",
+            &format!("{ip6}/{}", akurai_common::OVERLAY_IPV6_PREFIX_LEN),
+            "dev",
+            &cfg.iface,
+        ])
+        .status();
+    let _ = Command::new("ip")
+        .args([
+            "-6",
+            "route",
+            "add",
+            &format!(
+                "{}/{}",
+                akurai_common::OVERLAY_IPV6_NET,
+                akurai_common::OVERLAY_IPV6_PREFIX_LEN
+            ),
+            "dev",
+            &cfg.iface,
+        ])
+        .status();
     // Subnet routes: point each peer-advertised subnet at the overlay. A
     // 0.0.0.0/0 advertisement is SKIPPED here — a peer can never silently capture
     // all traffic; full-tunnel happens only via the explicit `--exit-node` opt-in.
@@ -236,14 +264,20 @@ fn tun_pump(
             Err(e) => return Err(e),
         };
         let pkt = &buf[..n];
-        if n < 20 || (pkt[0] >> 4) != 4 {
-            continue; // IPv4 only
-        }
-        let dest = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-        // Route to the carrying peer: an exact overlay peer, or the gateway peer
-        // advertising the subnet `dest` falls in. The session is keyed by the
-        // PEER overlay IP, so subnet traffic rides the gateway peer's session.
-        let Some(peer) = peers.route_to(&dest) else {
+        // Destination overlay IP — IPv4 (header dst @16) or IPv6 (header dst @24).
+        let dest: IpAddr = match pkt[0] >> 4 {
+            4 if n >= 20 => IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])),
+            6 if n >= 40 => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&pkt[24..40]);
+                IpAddr::V6(Ipv6Addr::from(b))
+            }
+            _ => continue,
+        };
+        // Route to the carrying peer: an exact overlay peer (v4 or derived v6), or
+        // the gateway peer advertising the subnet `dest` falls in. The session is
+        // keyed by the PEER's overlay IPv4, so all of a peer's traffic shares it.
+        let Some(peer) = peers.route_to_ip(dest) else {
             continue; // fail-closed: no peer/route for this destination
         };
         let peer_ip = peer.overlay_ip;

@@ -127,6 +127,14 @@ else
   RC=1
 fi
 
+say "9c. IPv6 overlay: ping node B over fd88::/48 (fd88::3)"
+if ip netns exec akv-a ping -6 -c 2 -W 2 fd88::3 >/dev/null 2>&1; then
+  echo "IPV6_CHECK: PASS (fd88::3 reachable over the overlay)"
+else
+  echo "IPV6_CHECK: FAIL"
+  RC=1
+fi
+
 say "10. fail-closed: an un-mapped destination is dropped"
 if ip netns exec akv-a ping -c 1 -W 2 100.88.0.9 >/dev/null 2>&1; then
   echo "FAILCLOSED_CHECK: FAIL (reached an un-mapped peer)"
