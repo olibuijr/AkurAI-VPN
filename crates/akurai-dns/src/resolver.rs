@@ -1,52 +1,34 @@
-//! The MagicDNS resolver (stub — DO NOT implement here).
-//!
-//! Maps overlay names in the [`ZONE`] zone to overlay IPs from the control
-//! plane's peer map. The UDP/53 server and the name→IP table are not
-//! implemented in 0.0.1; [`resolve`] always returns `None` and [`serve`]
-//! returns [`DnsError::NotImplemented`].
+//! Binary glue between the CLI and the [`akurai_dns`] library: load a hosts file
+//! and either serve MagicDNS or resolve a single name from it.
 
-use std::fmt;
-use std::net::IpAddr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 
-/// The internal DNS zone for overlay names.
-pub const ZONE: &str = "*.oli.akurai";
+/// Default flat zone for overlay names (`<label>.akurai`).
+pub const DEFAULT_ZONE: &str = "akurai";
+/// Default UDP bind address. Loopback so an unprivileged dev run never fights
+/// the system resolver; production binds the overlay address explicitly.
+pub const DEFAULT_BIND: &str = "127.0.0.1:53";
 
-/// Errors from the DNS service.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsError {
-    /// The DNS server is not implemented in 0.0.1.
-    NotImplemented,
+/// Load a hosts file (`<overlay_ip> <name>` per line) into a name table.
+pub fn load_hosts(path: &Path) -> std::io::Result<Vec<(String, Ipv4Addr)>> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(akurai_dns::parse_hosts(&content))
 }
 
-impl fmt::Display for DnsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DnsError::NotImplemented => {
-                write!(f, "DNS server not implemented in 0.0.1")
-            }
-        }
-    }
+/// Serve MagicDNS for `zone` on `bind`, answering from the static `hosts` table.
+pub fn serve(
+    bind: SocketAddr,
+    zone: String,
+    hosts: Vec<(String, Ipv4Addr)>,
+) -> std::io::Result<()> {
+    akurai_dns::serve(bind, &zone, move |label| {
+        akurai_dns::resolve_from_hosts(label, &hosts)
+    })
 }
 
-impl std::error::Error for DnsError {}
-
-/// Resolve an overlay name to its overlay IP. **Stub** — always `None` until
-/// the peer-map-backed zone table exists.
-pub fn resolve(_name: &str) -> Option<IpAddr> {
-    None
-}
-
-/// Start the DNS server. **Stub** — returns [`DnsError::NotImplemented`].
-pub fn serve() -> Result<(), DnsError> {
-    Err(DnsError::NotImplemented)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_is_a_stub_in_0_0_1() {
-        assert_eq!(resolve("laptop.oli.akurai"), None);
-    }
+/// Resolve a single (possibly zone-qualified) name against the `hosts` table.
+pub fn resolve(name: &str, zone: &str, hosts: &[(String, Ipv4Addr)]) -> Option<Ipv4Addr> {
+    let label = akurai_dns::strip_zone(name, zone);
+    akurai_dns::resolve_from_hosts(label, hosts)
 }
