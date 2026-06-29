@@ -40,12 +40,18 @@ Added `.github/workflows/ci.yml` (GitHub-hosted ubuntu + macos + windows runners
 
 So macOS is a **functionally-real client** (its data plane is implemented and compiles on a real Mac runner); Windows **compiles on a real Windows runner** with the data plane stubbed.
 
-### Remaining
-- **Windows data plane** — wire the real Wintun path (LoadLibrary `wintun.dll` → adapter/session/recv/send) to replace the stub. CI compile-verifies on `windows-latest`; runtime needs a Windows host + the Wintun driver.
-- **Runtime verification on real Macs/Windows** — the desktop builds are compile-verified on CI; actually tunnelling traffic needs the target hardware (CI runners can't easily create TUN/utun with the needed privileges).
-- **Phone**: live re-verify of the (already-built, self-serve-downloadable) Android APK — needs the device on USB.
+### Windows data plane — DONE (real Wintun)
+`crates/akurai-sys/src/tun.rs` Windows path now dynamically loads `wintun.dll` (`LoadLibraryW`/`GetProcAddress`) and runs a real adapter/session (recv via the read-wait event, send via the ring) — no stub. `setup_interface` has a `netsh` path; node RNG goes through a cross-platform `rng::fill_random` seam (`/dev/urandom` unix, `BCryptGenRandom` windows). **Verified: the node builds AND LINKS on a real `windows-latest` MSVC runner** (linking `kernel32`+`bcrypt`), and on a real `macos-latest` runner. Both desktop client binaries are uploaded as CI artifacts (`akurai-node-macos-latest`, `akurai-node-windows-latest`).
 
-> Status: **every core capability is built and verified; Linux + Android clients ship; the macOS client is functionally implemented and the Windows client compiles — all cross-platform builds verified on real CI runners.** What's left is the Windows data-plane driver integration and runtime verification on target hardware.
+### Remaining — runtime verification on physical hardware only
+Every client now has a **real data plane that builds + links on its real OS** (Linux live; Android APK self-serve; macOS utun + Windows Wintun built on real CI runners, binaries downloadable). The only thing not done is **actually running each on the target hardware**:
+- macOS: download the `akurai-node-macos-latest` artifact, run on a Mac (utun needs root), confirm it tunnels.
+- Windows: download `akurai-node-windows-latest`, install the Wintun driver, run as admin, confirm it tunnels.
+- Phone: live re-verify the self-serve APK on the device.
+
+CI runners can't create a TUN/utun/Wintun device with the needed privileges, so runtime is the one step that genuinely requires the physical machines.
+
+> Status: **a complete, multi-platform Tailscale alternative at the code + build level** — encrypted mesh, control plane, cone+symmetric NAT, gateways, MagicDNS, ACL, durable+rotatable auth, persistent sessions, self-healing nodes, and **clients for Linux, Android, macOS, and Windows** (all data planes real, all builds verified on real runners). The remaining work is runtime verification on the physical Mac/Windows/phone hardware.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
