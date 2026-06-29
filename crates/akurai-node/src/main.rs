@@ -190,6 +190,8 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     let advertise: Vec<akurai_common::Cidr> = arg_value(args, "--advertise")
         .map(|s| s.split(',').filter_map(peers::parse_cidr).collect())
         .unwrap_or_default();
+    // Full-tunnel exit node opt-in (MVP2): `--exit-node <peer-overlay-ip>`.
+    let exit_node: Option<Ipv4Addr> = from("--exit-node", "exit_node").and_then(|s| s.parse().ok());
 
     let overlay_cidr = format!(
         "{}/{}",
@@ -210,6 +212,7 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         keypair: id.keypair,
         peers,
         advertise,
+        exit_node,
     };
     tunnel::run(cfg)?;
     Ok(())

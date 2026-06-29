@@ -48,6 +48,9 @@ pub struct TunnelConfig {
     /// Subnets THIS node is a gateway for (MVP2). When non-empty, the node
     /// enables IP forwarding so it can relay overlay traffic to the real subnet.
     pub advertise: Vec<akurai_common::Cidr>,
+    /// Use this peer as a full-tunnel EXIT node (route 0.0.0.0/0 over the overlay
+    /// to it). Explicit opt-in only — `None` means normal split-tunnel.
+    pub exit_node: Option<Ipv4Addr>,
 }
 
 /// Per-peer session + path state, shared between the pump threads.
@@ -101,19 +104,49 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     ip(&["link", "set", &cfg.iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
     ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
-    // Subnet routes: point each peer-advertised subnet at the overlay. Still NEVER 0.0.0.0/0.
+    // Subnet routes: point each peer-advertised subnet at the overlay. A
+    // 0.0.0.0/0 advertisement is SKIPPED here — a peer can never silently capture
+    // all traffic; full-tunnel happens only via the explicit `--exit-node` opt-in.
     for (subnet, _gw) in cfg.peers.advertised_routes() {
+        if subnet.prefix_len() == 0 {
+            continue; // never auto-install a default route
+        }
         let cidr = subnet.to_string();
         let _ = Command::new("ip")
             .args(["route", "add", &cidr, "dev", &cfg.iface])
             .status();
     }
-    // If THIS node is a subnet gateway, enable IP forwarding to relay overlay
-    // traffic onward to the real subnet behind it.
+    // Exit node (full-tunnel), EXPLICIT opt-in only: route everything via the
+    // overlay using two /1 routes that out-specific the real default WITHOUT
+    // deleting it — so when the tunnel/TUN closes, normal routing is restored
+    // automatically. The chosen exit peer must advertise 0.0.0.0/0.
+    if let Some(exit) = cfg.exit_node {
+        eprintln!(
+            "{}: full-tunnel — routing 0.0.0.0/0 via exit node {exit}",
+            cfg.iface
+        );
+        let _ = Command::new("ip")
+            .args(["route", "add", "0.0.0.0/1", "dev", &cfg.iface])
+            .status();
+        let _ = Command::new("ip")
+            .args(["route", "add", "128.0.0.0/1", "dev", &cfg.iface])
+            .status();
+    }
+    // If THIS node is a gateway, enable IP forwarding. An exit gateway (advertising
+    // 0.0.0.0/0) also masquerades overlay traffic out its real interface.
     if !cfg.advertise.is_empty() {
         let _ = Command::new("sysctl")
             .args(["-qw", "net.ipv4.ip_forward=1"])
             .status();
+        if cfg.advertise.iter().any(|c| c.prefix_len() == 0) {
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    "iptables -t nat -C POSTROUTING -s 100.88.0.0/16 ! -o akurai0 -j MASQUERADE 2>/dev/null \
+                     || iptables -t nat -A POSTROUTING -s 100.88.0.0/16 ! -o akurai0 -j MASQUERADE",
+                ])
+                .status();
+        }
     }
     Ok(())
 }
