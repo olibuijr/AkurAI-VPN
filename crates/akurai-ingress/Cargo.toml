@@ -1,0 +1,18 @@
+[package]
+name = "akurai-ingress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AkurAI VPN public ingress: TCP proxy from a public port to an internal overlay service (MVP4)."
+
+[[bin]]
+name = "akurai-ingress"
+path = "src/main.rs"
+
+# Pure std, ZERO dependencies. The proxy splices opaque TCP bytes between a
+# public listener and an internal overlay target — it links no third-party crate
+# and never inspects payloads. The overlay target is reachable because the host
+# runs an AkurAI node with akurai0 up.
+[dependencies]
