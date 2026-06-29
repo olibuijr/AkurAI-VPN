@@ -12,7 +12,7 @@
 //!   `OIDC_ISSUER_URL`    — IDP base URL (default: `https://auth.olibuijr.com`)
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 
 // ---------------------------------------------------------------------------
 // AuthUser & session store
@@ -28,28 +28,196 @@ pub struct AuthUser {
     pub name: String,
 }
 
-/// In-memory session store.
+/// A single persisted session record.
+#[derive(Debug)]
+struct SessionRecord {
+    user: AuthUser,
+    csrf: String,
+    expires_at: u64,
+}
+
+/// Persistent session store backed by `$AKURAI_DATA_DIR/sessions.json`.
+///
+/// Records are written atomically on every insert/remove and loaded at startup.
+/// Expired records (where `expires_at <= now`) are dropped on load and excluded
+/// from every `get`/`csrf` lookup and from every `persist()` write.
 #[derive(Debug, Default)]
 pub struct SessionStore {
-    sessions: HashMap<String, AuthUser>,
+    sessions: HashMap<String, SessionRecord>,
 }
 
 impl SessionStore {
+    /// Create an empty in-memory store (used by tests and as an explicit blank slate).
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(&mut self, token: String, user: AuthUser) {
-        self.sessions.insert(token, user);
+    /// Load sessions from disk, silently dropping expired records.
+    ///
+    /// Missing file, empty file, or parse errors all produce an empty store.
+    pub fn load() -> Self {
+        let path = sessions_path();
+        let mut content = String::new();
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            let _ = f.read_to_string(&mut content);
+        }
+        let now = crate::vpn_endpoint::now_secs();
+        let sessions = parse_sessions(&content)
+            .into_iter()
+            .filter(|(_, rec)| rec.expires_at > now)
+            .collect();
+        Self { sessions }
     }
 
+    /// Insert a new session with a CSRF token and a TTL, then persist to disk.
+    pub fn insert(&mut self, token: String, user: AuthUser, csrf: String, ttl_secs: u64) {
+        let expires_at = crate::vpn_endpoint::now_secs() + ttl_secs;
+        self.sessions.insert(
+            token,
+            SessionRecord {
+                user,
+                csrf,
+                expires_at,
+            },
+        );
+        self.persist();
+    }
+
+    /// Return the authenticated user for a valid, non-expired session token.
     pub fn get(&self, token: &str) -> Option<&AuthUser> {
-        self.sessions.get(token)
+        let rec = self.sessions.get(token)?;
+        if rec.expires_at <= crate::vpn_endpoint::now_secs() {
+            return None;
+        }
+        Some(&rec.user)
     }
 
+    /// Return the CSRF token for a valid, non-expired session token.
+    pub fn csrf(&self, token: &str) -> Option<&str> {
+        let rec = self.sessions.get(token)?;
+        if rec.expires_at <= crate::vpn_endpoint::now_secs() {
+            return None;
+        }
+        Some(&rec.csrf)
+    }
+
+    /// Remove a session and immediately persist the updated store.
     pub fn remove(&mut self, token: &str) {
         self.sessions.remove(token);
+        self.persist();
     }
+
+    /// Atomically write all non-expired records to `sessions.json` via a
+    /// temp-file rename, mirroring the pattern in `vpn_endpoint::save`.
+    fn persist(&self) {
+        let path = sessions_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let now = crate::vpn_endpoint::now_secs();
+        let mut lines: Vec<String> = Vec::new();
+        for (token, rec) in &self.sessions {
+            if rec.expires_at <= now {
+                continue;
+            }
+            lines.push(format!(
+                "{{\"token\":\"{}\",\"sub\":\"{}\",\"email\":\"{}\",\
+                 \"name\":\"{}\",\"csrf\":\"{}\",\"expires_at\":{}}}",
+                session_json_esc(token),
+                session_json_esc(&rec.user.sub),
+                session_json_esc(&rec.user.email),
+                session_json_esc(&rec.user.name),
+                session_json_esc(&rec.csrf),
+                rec.expires_at,
+            ));
+        }
+        let json = format!("[\n{}\n]\n", lines.join(",\n"));
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(mut f) = std::fs::File::create(&tmp) {
+            let _ = f.write_all(json.as_bytes());
+            let _ = f.flush();
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session file helpers
+// ---------------------------------------------------------------------------
+
+/// Resolved path to the sessions data file.
+fn sessions_path() -> std::path::PathBuf {
+    let dir = std::env::var("AKURAI_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    std::path::Path::new(&dir).join("sessions.json")
+}
+
+/// JSON-escape a string value (backslash, quote, newlines).
+fn session_json_esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Extract a JSON u64 value by key from a flat JSON object.
+fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)?;
+    let rest = json[start + needle.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Split a JSON array body into individual object strings by brace depth.
+fn split_session_objects(s: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s_pos) = start.take() {
+                        objects.push(s[s_pos..=i].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    objects
+}
+
+/// Parse a sessions JSON file body into `(token, SessionRecord)` pairs.
+fn parse_sessions(json: &str) -> Vec<(String, SessionRecord)> {
+    split_session_objects(json.trim())
+        .into_iter()
+        .filter_map(|obj| {
+            let token = extract_json_str(&obj, "token")?;
+            let sub = extract_json_str(&obj, "sub").unwrap_or_default();
+            let email = extract_json_str(&obj, "email").unwrap_or_default();
+            let name = extract_json_str(&obj, "name").unwrap_or_default();
+            let csrf = extract_json_str(&obj, "csrf").unwrap_or_default();
+            let expires_at = extract_json_u64(&obj, "expires_at").unwrap_or(0);
+            Some((
+                token,
+                SessionRecord {
+                    user: AuthUser { sub, email, name },
+                    csrf,
+                    expires_at,
+                },
+            ))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -536,5 +704,99 @@ mod tests {
     #[test]
     fn session_cookie_missing() {
         assert_eq!(parse_session_cookie("foo=bar"), None);
+    }
+
+    // -- SessionStore --
+
+    #[test]
+    fn session_insert_get_roundtrip() {
+        let mut store = SessionStore::new();
+        let user = AuthUser {
+            sub: "sub-1".to_string(),
+            email: "a@example.com".to_string(),
+            name: "Alice".to_string(),
+        };
+        // Use a large TTL so the record does not expire during the test.
+        store.sessions.insert(
+            "tok-a".to_string(),
+            SessionRecord {
+                user: user.clone(),
+                csrf: "csrf-xyz".to_string(),
+                expires_at: crate::vpn_endpoint::now_secs() + 3600,
+            },
+        );
+        let got = store.get("tok-a").expect("should find user");
+        assert_eq!(got.sub, "sub-1");
+        assert_eq!(got.email, "a@example.com");
+        assert_eq!(got.name, "Alice");
+        assert_eq!(store.csrf("tok-a"), Some("csrf-xyz"));
+    }
+
+    #[test]
+    fn session_expired_returns_none() {
+        let mut store = SessionStore::new();
+        let user = AuthUser {
+            sub: "sub-2".to_string(),
+            email: "b@example.com".to_string(),
+            name: "Bob".to_string(),
+        };
+        // expires_at = 1 is safely in the past.
+        store.sessions.insert(
+            "tok-expired".to_string(),
+            SessionRecord {
+                user,
+                csrf: "csrf-old".to_string(),
+                expires_at: 1,
+            },
+        );
+        assert!(
+            store.get("tok-expired").is_none(),
+            "expired token must return None"
+        );
+        assert!(
+            store.csrf("tok-expired").is_none(),
+            "expired token csrf must return None"
+        );
+    }
+
+    #[test]
+    fn session_persist_load_roundtrip() {
+        // Unique directory derived from the test name — avoids parallel-test collisions.
+        let dir = "/tmp/akurai-ctl-test-sess-plrt";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::env::set_var("AKURAI_DATA_DIR", dir);
+
+        // Build a store with a future-expiry record and persist it.
+        let mut store = SessionStore::new();
+        let user = AuthUser {
+            sub: "u-persist".to_string(),
+            email: "p@example.com".to_string(),
+            name: "Persist".to_string(),
+        };
+        store.insert("tok-persist".to_string(), user, "csrf-p".to_string(), 3600);
+
+        // Overwrite the sessions file to also include a past-expiry record,
+        // simulating a record that expired while the server was running.
+        let future_exp = crate::vpn_endpoint::now_secs() + 3600;
+        let json = format!(
+            "[\n\
+            {{\"token\":\"tok-persist\",\"sub\":\"u-persist\",\"email\":\"p@example.com\",\
+            \"name\":\"Persist\",\"csrf\":\"csrf-p\",\"expires_at\":{future_exp}}},\n\
+            {{\"token\":\"tok-dead\",\"sub\":\"u-dead\",\"email\":\"d@example.com\",\
+            \"name\":\"Dead\",\"csrf\":\"csrf-d\",\"expires_at\":1}}\n]\n"
+        );
+        std::fs::write(format!("{dir}/sessions.json"), json).unwrap();
+
+        // load() must retain the future record and drop the past one.
+        let loaded = SessionStore::load();
+        let got = loaded
+            .get("tok-persist")
+            .expect("future-expiry record must survive load");
+        assert_eq!(got.sub, "u-persist");
+        assert!(
+            loaded.get("tok-dead").is_none(),
+            "past-expiry record must be pruned on load"
+        );
     }
 }

@@ -455,9 +455,8 @@ fn handle_callback(req: &Request, state: &SharedState) -> Response {
         user.email, user.sub
     );
     if let Ok(mut st) = state.lock() {
-        st.sessions.insert(session_token.clone(), user);
-        st.csrf_tokens
-            .insert(session_token.clone(), auth::random_token());
+        st.sessions
+            .insert(session_token.clone(), user, auth::random_token(), 86400);
     }
 
     let set_cookie = format!(
@@ -471,7 +470,6 @@ fn handle_logout(req: &Request, state: &SharedState) -> Response {
         if let Some(token) = auth::parse_session_cookie(cookie) {
             if let Ok(mut st) = state.lock() {
                 st.sessions.remove(&token);
-                st.csrf_tokens.remove(&token);
             }
         }
     }
@@ -740,7 +738,7 @@ fn require_auth(req: &Request, state: &SharedState) -> Option<AuthSession> {
     let token = auth::parse_session_cookie(cookie)?;
     let st = state.lock().ok()?;
     let user = st.sessions.get(&token).cloned()?;
-    let csrf_token = st.csrf_tokens.get(&token).cloned()?;
+    let csrf_token = st.sessions.csrf(&token)?.to_string();
     Some(AuthSession { user, csrf_token })
 }
 

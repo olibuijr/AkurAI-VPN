@@ -12,14 +12,15 @@ use crate::vpn_endpoint::VpnEndpoint;
 
 /// All mutable runtime state for the control plane.
 pub struct AppState {
-    /// In-memory session store (keyed by opaque session token).
+    /// Persistent session store (keyed by opaque session token).
+    /// Sessions survive restarts: loaded from disk at startup, written
+    /// atomically on every login/logout. CSRF tokens are stored inside
+    /// each session record rather than in a separate map.
     pub sessions: SessionStore,
     /// Registered VPN endpoints, mirrored to disk on every write.
     pub endpoints: Vec<VpnEndpoint>,
     /// Pending OIDC `state` nonces — used for CSRF validation on the callback.
     pub pending_states: HashSet<String>,
-    /// Per-session CSRF tokens for state-changing dashboard/API requests.
-    pub csrf_tokens: HashMap<String, String>,
     /// Per-node heartbeat liveness, keyed by node id. In-memory only — a node's
     /// liveness is re-established by its next heartbeat after a restart.
     pub heartbeats: HashMap<String, Heartbeat>,
@@ -54,10 +55,9 @@ impl AppState {
         }
 
         Self {
-            sessions: SessionStore::new(),
+            sessions: SessionStore::load(),
             endpoints,
             pending_states: HashSet::new(),
-            csrf_tokens: HashMap::new(),
             heartbeats: HashMap::new(),
         }
     }
