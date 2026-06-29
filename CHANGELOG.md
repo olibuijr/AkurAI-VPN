@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-29
+
+### Added
+- working encrypted overlay mesh (akurai-sys TUN + node pump + relay)
+- peer map + heartbeat endpoints for mesh data plane
+
+### Changed
+- remove stale akurai-common transport stub (decision resolved → akurai-transport)
+- sync lockfile for v0.0.9
+- record v0.0.9 overlay IPAM milestone + next data-plane fork
+
+
+
 ## [0.0.9] - 2026-06-28
 
 ### Added
