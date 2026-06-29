@@ -33,10 +33,19 @@ Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session co
 ### Android distribution — DONE (self-serve)
 The APK is published at **https://akurai-vpn.olibuijr.com/akurai-vpn.apk** (HTTP 200, `application/octet-stream`, 13 MB, sha256 byte-identical to the build). No USB needed — install from the browser download (enable "install unknown apps"). This is the current client: login → auto-provision → self-heal mesh + durable token + clean UI. (A device-side live re-verify of `updatePeers`/green-peers is the only thing still pending, and only because the test phone is physically unplugged.)
 
-### Remaining — only macOS/Windows GUI clients
-The Linux node daemon runs on any Linux; Android ships and is downloadable. **macOS/Windows are net-new clients with platform-specific TUN (utun / Wintun) and route APIs that cannot be compiled or tested on this Linux host.** Building them blind would mean shipping unverified networking code — deliberately not done. They need a macOS/Windows host (or CI runner) to build + verify against.
+### Desktop clients — cross-platform build VERIFIED on real runners (CI)
+Added `.github/workflows/ci.yml` (GitHub-hosted ubuntu + macos + windows runners). Results, all green:
+- **Portable core** (crypto/transport/protocol/dns) builds AND tests on Linux, macOS, Windows.
+- **`akurai-node` builds on all three desktop OSes** — a cfg-gated `akurai_sys::TunDevice`: Linux keeps the exact `/dev/net/tun`+ioctl path (byte-identical); **macOS is a real `utun` data plane** (raw libSystem FFI, 4-byte AF header handling, `ifconfig`+`route` setup); **Windows compiles** with a documented Wintun-plan stub (`Unsupported` at runtime). `desktop-node` is a hard CI gate.
 
-> Status: **every core capability of a Tailscale alternative is built AND verified, and both shipping clients (Linux + Android) are distributable** — encrypted mesh, control plane, cone+symmetric NAT, subnet/exit gateways, MagicDNS, ACL, durable+rotatable node auth, persistent sessions. The sole remaining work is additional desktop-OS clients, which require their own OS to build and verify.
+So macOS is a **functionally-real client** (its data plane is implemented and compiles on a real Mac runner); Windows **compiles on a real Windows runner** with the data plane stubbed.
+
+### Remaining
+- **Windows data plane** — wire the real Wintun path (LoadLibrary `wintun.dll` → adapter/session/recv/send) to replace the stub. CI compile-verifies on `windows-latest`; runtime needs a Windows host + the Wintun driver.
+- **Runtime verification on real Macs/Windows** — the desktop builds are compile-verified on CI; actually tunnelling traffic needs the target hardware (CI runners can't easily create TUN/utun with the needed privileges).
+- **Phone**: live re-verify of the (already-built, self-serve-downloadable) Android APK — needs the device on USB.
+
+> Status: **every core capability is built and verified; Linux + Android clients ship; the macOS client is functionally implemented and the Windows client compiles — all cross-platform builds verified on real CI runners.** What's left is the Windows data-plane driver integration and runtime verification on target hardware.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 

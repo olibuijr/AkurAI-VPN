@@ -38,13 +38,12 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
 
-  # Desktop node port — builds the client daemon on macOS + Windows. Marked
-  # continue-on-error until the utun/Wintun platform layer lands, so the run
-  # surfaces the exact platform gaps without blocking the rest of CI.
+  # Desktop node — builds the client daemon on macOS + Windows on real runners.
+  # macOS has a real utun data plane; Windows compiles (Wintun data plane pending).
+  # This is now a hard gate: a regression in the cross-platform build fails CI.
   desktop-node:
     name: desktop node (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
