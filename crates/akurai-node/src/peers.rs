@@ -12,11 +12,12 @@
 //! destination not in the table is dropped by the data plane.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::process::Command;
 
 use akurai_common::b64;
+use akurai_common::Cidr;
 
 /// One reachable overlay peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,10 @@ pub struct Peer {
     pub overlay_ip: Ipv4Addr,
     pub public_key: [u8; 32],
     pub name: String,
+    /// Subnets this peer is an approved gateway for (MVP2 subnet routing). A
+    /// packet whose destination falls in one of these is tunnelled to this peer,
+    /// which forwards it to the real subnet behind it.
+    pub advertised: Vec<Cidr>,
 }
 
 /// Overlay-IP-indexed peer table.
@@ -43,6 +48,27 @@ impl PeerTable {
 
     pub fn get(&self, ip: &Ipv4Addr) -> Option<&Peer> {
         self.by_ip.get(ip)
+    }
+
+    /// Resolve a destination IPv4 to the peer that should carry it: an exact
+    /// overlay-IP match first, otherwise the peer advertising a subnet that
+    /// contains it (MVP2 subnet routing). `None` ⇒ fail-closed drop.
+    pub fn route_to(&self, dest: &Ipv4Addr) -> Option<&Peer> {
+        if let Some(p) = self.by_ip.get(dest) {
+            return Some(p);
+        }
+        self.by_ip
+            .values()
+            .find(|p| p.advertised.iter().any(|c| c.contains(IpAddr::V4(*dest))))
+    }
+
+    /// Every (subnet, gateway-peer-overlay-IP) pair, for installing routes that
+    /// point advertised subnets at the overlay interface.
+    pub fn advertised_routes(&self) -> Vec<(Cidr, Ipv4Addr)> {
+        self.by_ip
+            .values()
+            .flat_map(|p| p.advertised.iter().map(|c| (*c, p.overlay_ip)))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -94,15 +120,30 @@ pub fn parse_peers_file(content: &str) -> Vec<Peer> {
             continue;
         };
         let name = parts.next().unwrap_or("").to_string();
+        // Optional 4th field: comma-separated advertised subnets (gateway peer).
+        let advertised = parts
+            .next()
+            .map(|s| s.split(',').filter_map(parse_cidr).collect())
+            .unwrap_or_default();
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
+                advertised,
             });
         }
     }
     peers
+}
+
+/// Parse a CIDR like `192.168.50.0/24` into an [`akurai_common::Cidr`].
+pub fn parse_cidr(s: &str) -> Option<Cidr> {
+    let s = s.trim();
+    let (addr_s, prefix_s) = s.split_once('/')?;
+    let addr: IpAddr = addr_s.parse().ok()?;
+    let prefix: u8 = prefix_s.parse().ok()?;
+    Cidr::new(addr, prefix).ok()
 }
 
 /// Parse the control plane's peer-map JSON array
@@ -119,11 +160,17 @@ pub fn parse_peermap_json(json: &str) -> Vec<Peer> {
             continue;
         };
         let name = json_str_field(obj, "name").unwrap_or_default();
+        // The control plane's peer map may carry comma-separated advertised
+        // subnets in an "advertised" field; absent in MVP1 → empty.
+        let advertised = json_str_field(obj, "advertised")
+            .map(|s| s.split(',').filter_map(parse_cidr).collect())
+            .unwrap_or_default();
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(&pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
+                advertised,
             });
         }
     }
@@ -188,8 +235,42 @@ mod tests {
             overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
             public_key: pk(1),
             name: "b".into(),
+            advertised: vec![],
         }]);
         assert!(t.get(&Ipv4Addr::new(100, 88, 0, 3)).is_some());
         assert!(t.get(&Ipv4Addr::new(100, 88, 0, 9)).is_none());
+    }
+
+    #[test]
+    fn parses_advertised_subnets() {
+        let pk_b64 = b64::encode(&pk(3));
+        let peers = parse_peers_file(&format!(
+            "100.88.0.3 {pk_b64} gw 192.168.50.0/24,10.20.0.0/16\n"
+        ));
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].advertised.len(), 2);
+    }
+
+    #[test]
+    fn route_to_prefers_exact_then_subnet() {
+        let t = PeerTable::from_peers(vec![Peer {
+            overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
+            public_key: pk(1),
+            name: "gw".into(),
+            advertised: vec![parse_cidr("192.168.50.0/24").unwrap()],
+        }]);
+        // Exact overlay IP.
+        assert_eq!(
+            t.route_to(&Ipv4Addr::new(100, 88, 0, 3)).unwrap().name,
+            "gw"
+        );
+        // A subnet IP routes via the advertising gateway.
+        assert_eq!(
+            t.route_to(&Ipv4Addr::new(192, 168, 50, 7)).unwrap().name,
+            "gw"
+        );
+        // Outside any subnet / overlay → fail-closed.
+        assert!(t.route_to(&Ipv4Addr::new(8, 8, 8, 8)).is_none());
+        assert_eq!(t.advertised_routes().len(), 1);
     }
 }

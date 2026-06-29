@@ -41,6 +41,9 @@ pub struct TunnelConfig {
     pub relay: SocketAddr,
     pub keypair: Keypair,
     pub peers: PeerTable,
+    /// Subnets THIS node is a gateway for (MVP2). When non-empty, the node
+    /// enables IP forwarding so it can relay overlay traffic to the real subnet.
+    pub advertise: Vec<akurai_common::Cidr>,
 }
 
 /// Per-peer Noise session state, shared between the two pump threads.
@@ -76,6 +79,22 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     ip(&["link", "set", &cfg.iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
     ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
+    // Subnet routes: point each peer-advertised subnet at the overlay so packets
+    // for it are tunnelled to the advertising gateway. Still NEVER 0.0.0.0/0.
+    for (subnet, _gw) in cfg.peers.advertised_routes() {
+        let cidr = subnet.to_string();
+        // Best-effort: a subnet may already be routed; ignore an add failure.
+        let _ = Command::new("ip")
+            .args(["route", "add", &cidr, "dev", &cfg.iface])
+            .status();
+    }
+    // If THIS node is a subnet gateway, enable IP forwarding so it can relay
+    // overlay traffic onward to the real subnet behind it.
+    if !cfg.advertise.is_empty() {
+        let _ = Command::new("sysctl")
+            .args(["-qw", "net.ipv4.ip_forward=1"])
+            .status();
+    }
     Ok(())
 }
 
@@ -148,25 +167,31 @@ fn tun_pump(
             continue;
         }
         let dest = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-        let Some(peer) = peers.get(&dest) else {
-            continue; // fail-closed: unknown destination dropped
+        // Route to the carrying peer: an exact overlay peer, or the gateway peer
+        // advertising the subnet `dest` falls in. The Noise session is keyed by
+        // the PEER's overlay IP (not the inner destination), so subnet traffic
+        // rides the gateway peer's session; the gateway forwards the inner packet.
+        let Some(peer) = peers.route_to(&dest) else {
+            continue; // fail-closed: no peer/route for this destination
         };
+        let peer_ip = peer.overlay_ip;
+        let peer_pub = peer.public_key;
 
         // Decide what to emit while holding the lock; send after releasing it.
         let mut to_send: Option<Vec<u8>> = None;
         {
             let mut tbl = sessions.lock().unwrap();
-            if let Some(sess) = tbl.established.get_mut(&dest) {
+            if let Some(sess) = tbl.established.get_mut(&peer_ip) {
                 let ct = sess.encrypt(pkt);
-                to_send = Frame::new(FrameKind::Data, my_ip, dest, ct).map(|f| f.encode());
-            } else if let Entry::Vacant(slot) = tbl.pending.entry(dest) {
+                to_send = Frame::new(FrameKind::Data, my_ip, peer_ip, ct).map(|f| f.encode());
+            } else if let Entry::Vacant(slot) = tbl.pending.entry(peer_ip) {
                 // First contact: initiate a handshake and drop this packet (the
                 // upper layer — ICMP/TCP — retransmits once we have a session).
                 if let Ok(eph) = rand32() {
-                    let (state, msg1) = noise::initiate(&kp, &peer.public_key, &eph);
+                    let (state, msg1) = noise::initiate(&kp, &peer_pub, &eph);
                     slot.insert(state);
-                    to_send =
-                        Frame::new(FrameKind::HandshakeInit, my_ip, dest, msg1).map(|f| f.encode());
+                    to_send = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1)
+                        .map(|f| f.encode());
                 }
             }
         }

@@ -169,6 +169,11 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         eprintln!("{NAME}: warning — no peers loaded; the tunnel reaches nothing until a peer map is available");
     }
 
+    // Subnets this node advertises as a gateway (MVP2): `--advertise a/24,b/16`.
+    let advertise: Vec<akurai_common::Cidr> = arg_value(args, "--advertise")
+        .map(|s| s.split(',').filter_map(peers::parse_cidr).collect())
+        .unwrap_or_default();
+
     let overlay_cidr = format!(
         "{}/{}",
         akurai_common::OVERLAY_IPV4_NET,
@@ -187,6 +192,7 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         relay,
         keypair: id.keypair,
         peers,
+        advertise,
     };
     tunnel::run(cfg)?;
     Ok(())
