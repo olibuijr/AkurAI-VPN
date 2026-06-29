@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-29
+
+### Added
+- persistent + expiring session store (logins survive restarts)
+
+### Changed
+- HANDOFF v0.3.1 — self-healing nodes + durable node auth tokens
+
+
+
 ## [0.3.1] - 2026-06-29
 
 ### Fixed
