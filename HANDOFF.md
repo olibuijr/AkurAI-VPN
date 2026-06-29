@@ -4,6 +4,27 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Update — 2026-06-29 (v0.3.1): self-healing nodes + durable node auth tokens — production hardening
+
+Two production-hardening milestones on top of v0.2.0, both **verified live** on the two Linux nodes (ec2-peer + midget):
+
+### Self-healing (reconnect on failures + membership updates)
+- **Node**: `udp_pump` no longer dies on a generic `recv_from` error — it logs, sleeps briefly, and continues. The peer table is now `Arc<RwLock<Arc<PeerTable>>>` and a 30s background thread re-fetches `/api/peermap` and hot-swaps it (empty/failed fetch keeps the old table — never wipes). So nodes pick up membership changes without a restart. Proven: `peers refreshed — N peer(s)` in journald; the previously-failing midget↔ec2 ping now succeeds (~145ms).
+- **Process level**: both Linux nodes now run as **systemd `akurai-node.service` (`Restart=always`)** — binary at `/usr/local/bin/akurai-node`, `--home` per node, overlay midget=`100.88.0.5` / ec2-peer=`100.88.0.4`. SIGKILL → auto-restart in <8s (verified). Host default route untouched throughout.
+- **Android** (built, not yet device-verified): native `updatePeers()` hot-swaps the peer map without dropping the TUN; the app pushes membership changes every 10s; `START_STICKY` + a `ConnectivityManager` callback re-asserts the tunnel on network regain.
+
+### Durable per-node auth tokens (the cookie-expiry fix)
+Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session cookie, which expires in ~24h and is wiped on every control-plane restart** (in-memory session store) — so always-on nodes silently lost auth. Fixed with Tailscale's auth-key model:
+- Each `VpnEndpoint` carries a durable `node_token` (`aknk_` + 64 hex), issued at registration and **backfilled** for existing nodes at startup.
+- `/api/peermap`, `/api/heartbeat`, `/api/endpoints` accept `Authorization: Bearer <token>` (cookie tried first, unchanged; token path skips CSRF and enforces same-owner; heartbeat backfills the node id from the token).
+- The node **self-bootstraps** `config/node.token` from the cookie on first run, then uses Bearer for peer-fetch + refresh + heartbeat. **Proven cookie-independent**: with `cookies.txt` deleted, midget came up, fetched peers, refreshed, heartbeated, and stayed `online:true` purely on the token.
+- Control plane is **v0.3.1 live** at vpn.olibuijr.com (deployed via `./deploy.sh`; gates fmt+clippy+test).
+
+### Remaining
+- **Phone**: install the reconnect APK (blocked — device was unplugged from USB mid-session); then add **token auth to the Android client** so the phone is durable too (today it's still cookie-based, so it goes offline on a control-plane restart — that is why CPH2645 shows offline after the v0.3.x deploys).
+- **Operational**: a control-plane deploy still logs out all *cookie* sessions (in-memory store); durable tokens make nodes immune, but a persistent session store (or short-lived access + refresh) would also keep browser/dashboard sessions alive across deploys.
+- Token **revoke/rotate** UI in the dashboard.
+
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
 Built on top of the v0.1.0 mesh, all pure-Rust zero-dep, each **verified in network namespaces** (host stack never touched) and committed:
