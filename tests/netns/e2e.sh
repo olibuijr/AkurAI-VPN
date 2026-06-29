@@ -115,6 +115,15 @@ if command -v tcpdump >/dev/null; then
   fi
 fi
 
+say "9b. MagicDNS: resolve and ping node B by name (nodeb.akurai)"
+ip netns exec akv-a sh -c 'printf "nameserver 100.88.0.2\n" > /etc/resolv.conf 2>/dev/null || true'
+if ip netns exec akv-a ping -c 2 -W 2 nodeb.akurai >/dev/null 2>&1; then
+  echo "MAGICDNS_CHECK: PASS (nodeb.akurai resolved + reachable)"
+else
+  echo "MAGICDNS_CHECK: FAIL"
+  RC=1
+fi
+
 say "10. fail-closed: an un-mapped destination is dropped"
 if ip netns exec akv-a ping -c 1 -W 2 100.88.0.9 >/dev/null 2>&1; then
   echo "FAILCLOSED_CHECK: FAIL (reached an un-mapped peer)"

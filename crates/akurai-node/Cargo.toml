@@ -20,3 +20,4 @@ akurai-common = { path = "../akurai-common" }
 akurai-crypto = { path = "../akurai-crypto" }
 akurai-transport = { path = "../akurai-transport" }
 akurai-sys = { path = "../akurai-sys" }
+akurai-dns = { path = "../akurai-dns" }

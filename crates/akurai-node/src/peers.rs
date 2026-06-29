@@ -62,6 +62,18 @@ impl PeerTable {
             .find(|p| p.advertised.iter().any(|c| c.contains(IpAddr::V4(*dest))))
     }
 
+    /// Resolve a peer NAME (case-insensitive) to its overlay IP — MagicDNS.
+    pub fn resolve_name(&self, name: &str) -> Option<Ipv4Addr> {
+        let want = name.trim().to_ascii_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        self.by_ip
+            .values()
+            .find(|p| p.name.to_ascii_lowercase() == want)
+            .map(|p| p.overlay_ip)
+    }
+
     /// Every (subnet, gateway-peer-overlay-IP) pair, for installing routes that
     /// point advertised subnets at the overlay interface.
     pub fn advertised_routes(&self) -> Vec<(Cidr, Ipv4Addr)> {

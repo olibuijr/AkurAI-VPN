@@ -112,6 +112,17 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let kp = Arc::new(cfg.keypair);
     let my_ip = cfg.overlay_ip;
 
+    // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer's
+    // overlay IP, served on the node's own overlay IP:53. Point the system
+    // resolver at this address (e.g. `nameserver <overlay_ip>`) to `ping nodeb`.
+    {
+        let dns_peers = Arc::clone(&peers);
+        let bind = SocketAddr::from((my_ip, 53));
+        thread::spawn(move || {
+            let _ = akurai_dns::serve(bind, "akurai", move |label| dns_peers.resolve_name(label));
+        });
+    }
+
     // Teach the relay our endpoint, and keep it (and any NAT mapping) fresh.
     let keepalive_sock = Arc::clone(&sock);
     let _keepalive = thread::spawn(move || loop {
