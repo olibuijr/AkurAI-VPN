@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-29
+
+### Added
+- durable per-node auth token (cookie bootstraps, token takes over)
+- self-healing — recv survives errors, 30s peer-map refresh hot-swap
+- control-plane heartbeat — running nodes report ONLINE
+- ACL enforcement in the data path (fail-closed policy)
+- MVP4 public ingress — TCP proxy from a public port to an internal overlay service
+- IPv6 overlay data path (fd88::/48)
+
+### Fixed
+- heartbeat uses JSON body + X-CSRF-Token header
+
+### Changed
+- ACL + MVP4 ingress + IPv6 done; Android client in progress
+- v0.2.0 — MVP1-3 + MagicDNS + gateways + multi-arch; honest MVP4/ACL/IPv6 roadmap
+
+
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
