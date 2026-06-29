@@ -1,0 +1,16 @@
+[Unit]
+Description=AkurAI VPN relay (ciphertext-only UDP forward hub)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RELAY_PORT=51820
+ExecStart=/opt/akurai-vpn-relay/bin/akurai-relay serve
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
