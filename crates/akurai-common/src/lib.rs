@@ -5,11 +5,12 @@
 //! model, and the node descriptor that the control plane distributes. Every
 //! type here is a value type with no I/O and no cryptography.
 //!
-//! **No cryptography lives in this crate.** [`MachineKey`] is an opaque
-//! placeholder and [`transport`] is a deliberate stub. The choice of transport
-//! and handshake — and whether a vetted crypto crate may be linked despite the
-//! zero-dependency principle — is an UNRESOLVED DECISION documented in
-//! `docs/protocol.md`.
+//! **No cryptography lives in this crate.** The data-plane secure channel is
+//! implemented in the sibling `akurai-transport` crate (Noise_IK over the
+//! `akurai-crypto` primitives) — the zero-dependency-custom-crypto decision is
+//! resolved. This crate carries only the value vocabulary: identities,
+//! addressing, the policy model, the node descriptor, and the relay [`frame`]
+//! envelope codec.
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +21,6 @@ pub mod ids;
 pub mod node;
 pub mod overlay;
 pub mod policy;
-pub mod transport;
 
 pub use cidr::Cidr;
 pub use frame::{Frame, FrameKind};
@@ -31,4 +31,3 @@ pub use overlay::{
     OVERLAY_IPV6_PREFIX_LEN, OVERLAY_MTU, TUN_INTERFACE,
 };
 pub use policy::{AclRule, Decision, GatewayMode, Policy, Principal, Route, Tag};
-pub use transport::{Session, TransportError};
