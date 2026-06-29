@@ -20,7 +20,7 @@
 //! carries everything. End-to-end: the relay only ever sees ciphertext.
 //! Fail-closed: a packet to an unknown destination, or from an unverified peer, is dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -34,6 +34,7 @@ use akurai_transport::noise::{self, Initiator};
 use akurai_transport::session::Session;
 use akurai_transport::Keypair;
 
+use crate::acl::Acl;
 use crate::peers::PeerTable;
 
 /// Runtime configuration for the data-plane daemon.
@@ -51,6 +52,10 @@ pub struct TunnelConfig {
     /// Use this peer as a full-tunnel EXIT node (route 0.0.0.0/0 over the overlay
     /// to it). Explicit opt-in only — `None` means normal split-tunnel.
     pub exit_node: Option<Ipv4Addr>,
+    /// Fine-grained ACL (MVP4). `Some` ⇒ enforce a fail-closed tag policy on
+    /// every outbound flow (`this-node → routing-peer`); `None` ⇒ no ACL file,
+    /// so any peer in the map is reachable (network-membership-only).
+    pub acl: Option<Acl>,
 }
 
 /// Per-peer session + path state, shared between the pump threads.
@@ -68,6 +73,21 @@ struct PeerState {
 }
 
 type Table = HashMap<Ipv4Addr, PeerState>;
+
+/// The handles both pump loops share: the TUN, the UDP socket, the per-peer
+/// state table, the peer/routing table, this node's keypair, its overlay IP,
+/// and the relay address. Bundled (and cheaply `Clone`, since the heavy members
+/// are `Arc`s) so each pump takes a single context argument.
+#[derive(Clone)]
+struct Pump {
+    tun: Arc<File>,
+    sock: Arc<UdpSocket>,
+    table: Arc<Mutex<Table>>,
+    peers: Arc<PeerTable>,
+    kp: Arc<Keypair>,
+    my_ip: Ipv4Addr,
+    relay: SocketAddr,
+}
 
 /// 32 bytes of OS entropy for an ephemeral handshake secret.
 fn rand32() -> io::Result<[u8; 32]> {
@@ -163,6 +183,9 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let peers = Arc::new(cfg.peers);
     let kp = Arc::new(cfg.keypair);
     let my_ip = cfg.overlay_ip;
+    // ACL is consulted only on the outbound (TUN→UDP) path, which runs on this
+    // thread, so it need not be shared with the UDP pump.
+    let acl = cfg.acl;
 
     // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer's
     // overlay IP, served on the node's own overlay IP:53.
@@ -200,16 +223,21 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
         });
     }
 
+    let pump = Pump {
+        tun,
+        sock,
+        table,
+        peers,
+        kp,
+        my_ip,
+        relay,
+    };
     let udp = {
-        let tun = Arc::clone(&tun);
-        let sock = Arc::clone(&sock);
-        let table = Arc::clone(&table);
-        let peers = Arc::clone(&peers);
-        let kp = Arc::clone(&kp);
-        thread::spawn(move || udp_pump(tun, sock, table, peers, kp, my_ip, relay))
+        let pump = pump.clone();
+        thread::spawn(move || udp_pump(pump))
     };
 
-    tun_pump(tun, sock, table, peers, kp, my_ip, relay)?;
+    tun_pump(pump, acl)?;
     let _ = udp.join();
     Ok(())
 }
@@ -217,16 +245,19 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
 /// Read packets from the TUN, encrypt to the routing peer (initiating a handshake
 /// via the relay on first contact), and send `Data` frames on the peer's current
 /// path (direct if confirmed, else the relay).
-fn tun_pump(
-    tun: Arc<File>,
-    sock: Arc<UdpSocket>,
-    table: Arc<Mutex<Table>>,
-    peers: Arc<PeerTable>,
-    kp: Arc<Keypair>,
-    my_ip: Ipv4Addr,
-    relay: SocketAddr,
-) -> io::Result<()> {
+fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
+    let Pump {
+        tun,
+        sock,
+        table,
+        peers,
+        kp,
+        my_ip,
+        relay,
+    } = pump;
     let mut buf = [0u8; 2048];
+    // Peers already logged as ACL-denied, so the drop notice prints once each.
+    let mut acl_denied_logged: HashSet<Ipv4Addr> = HashSet::new();
     loop {
         let mut tunref: &File = &tun;
         let n = match tunref.read(&mut buf) {
@@ -246,6 +277,23 @@ fn tun_pump(
         let Some(peer) = peers.route_to(&dest) else {
             continue; // fail-closed: no peer/route for this destination
         };
+        // Fine-grained ACL gate (fail-closed): if enforcement is on and this
+        // node is not permitted to reach the routing peer, DROP the packet —
+        // no handshake, no send, no per-peer state. A one-time notice per
+        // denied peer keeps the data path silent but observable.
+        if let Some(acl) = acl.as_ref() {
+            if !acl.permits(peer) {
+                if acl_denied_logged.insert(peer.overlay_ip) {
+                    let label = if peer.name.is_empty() {
+                        peer.overlay_ip.to_string()
+                    } else {
+                        peer.name.clone()
+                    };
+                    eprintln!("acl: denied {label}");
+                }
+                continue;
+            }
+        }
         let peer_ip = peer.overlay_ip;
         let peer_pub = peer.public_key;
 
@@ -277,15 +325,16 @@ fn tun_pump(
 /// Receive frames: confirm direct paths, complete handshakes, act on `PeerAddr`
 /// hints, or decrypt `Data` and write the inner packet to the TUN. Survives
 /// malformed datagrams (continues).
-fn udp_pump(
-    tun: Arc<File>,
-    sock: Arc<UdpSocket>,
-    table: Arc<Mutex<Table>>,
-    peers: Arc<PeerTable>,
-    kp: Arc<Keypair>,
-    my_ip: Ipv4Addr,
-    relay: SocketAddr,
-) {
+fn udp_pump(pump: Pump) {
+    let Pump {
+        tun,
+        sock,
+        table,
+        peers,
+        kp,
+        my_ip,
+        relay,
+    } = pump;
     let mut buf = [0u8; 4096];
     loop {
         let (n, from) = match sock.recv_from(&mut buf) {
