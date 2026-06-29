@@ -244,6 +244,8 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         advertise,
         exit_node,
         acl,
+        control_url: from("--control", "control"),
+        cookie_jar: Some(dirs.config.join("cookies.txt")),
     };
     tunnel::run(cfg)?;
     Ok(())

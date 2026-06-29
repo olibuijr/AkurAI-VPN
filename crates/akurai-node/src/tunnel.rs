@@ -1,12 +1,12 @@
 //! The data plane — an encrypted overlay pump with relay fallback and direct paths.
 //!
 //! `run` opens the `akurai0` TUN, assigns the node's overlay IP and a
-//! `100.88.0.0/16`-ONLY route (never a default route — the host's internet path
+//! `100.88.0.0/16`-ONLY route (never a default route — the host\'s internet path
 //! is inviolable), binds a UDP socket, and runs two blocking pumps over a shared
 //! per-peer state table:
 //!
 //! - **TUN → UDP**: read an IPv4 packet, route it to the carrying peer, encrypt
-//!   with that peer's Noise session, and send a `Data` frame on the peer's
+//!   with that peer\'s Noise session, and send a `Data` frame on the peer\'s
 //!   current path — a **direct** UDP address once one is confirmed, otherwise the
 //!   relay (which forwards by destination overlay IP).
 //! - **UDP → TUN**: receive a frame; complete handshakes, learn/confirm direct
@@ -14,7 +14,7 @@
 //!   packet to the TUN.
 //!
 //! Direct paths (MVP3): handshakes go via the relay, which sends each end a
-//! `PeerAddr` hint with the other's observed UDP address. Both nodes probe that
+//! `PeerAddr` hint with the other\'s observed UDP address. Both nodes probe that
 //! address (opening any NAT hole); a frame received straight from a peer confirms
 //! the direct path and traffic leaves the hub. If no direct path forms, the relay
 //! carries everything. End-to-end: the relay only ever sees ciphertext.
@@ -24,8 +24,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -56,6 +57,13 @@ pub struct TunnelConfig {
     /// every outbound flow (`this-node → routing-peer`); `None` ⇒ no ACL file,
     /// so any peer in the map is reachable (network-membership-only).
     pub acl: Option<Acl>,
+    /// Control-plane URL for periodic peer-map refresh (`GET /api/peermap`).
+    /// When `Some`, a background thread fetches every 30 s and hot-swaps the
+    /// peer table. `None` ⇒ no refresh (static file or one-shot fetch only).
+    pub control_url: Option<String>,
+    /// Cookie jar path passed to `curl` for authenticated control-plane requests.
+    /// Paired with `control_url`; both must be `Some` to enable the refresh thread.
+    pub cookie_jar: Option<PathBuf>,
 }
 
 /// Per-peer session + path state, shared between the pump threads.
@@ -75,7 +83,7 @@ struct PeerState {
 type Table = HashMap<Ipv4Addr, PeerState>;
 
 /// The handles both pump loops share: the TUN, the UDP socket, the per-peer
-/// state table, the peer/routing table, this node's keypair, its overlay IP,
+/// state table, the peer/routing table, this node\'s keypair, its overlay IP,
 /// and the relay address. Bundled (and cheaply `Clone`, since the heavy members
 /// are `Arc`s) so each pump takes a single context argument.
 #[derive(Clone)]
@@ -83,7 +91,7 @@ struct Pump {
     tun: Arc<File>,
     sock: Arc<UdpSocket>,
     table: Arc<Mutex<Table>>,
-    peers: Arc<PeerTable>,
+    peers: Arc<RwLock<Arc<PeerTable>>>,
     kp: Arc<Keypair>,
     my_ip: Ipv4Addr,
     relay: SocketAddr,
@@ -124,7 +132,7 @@ fn setup_interface(cfg: &TunnelConfig) -> io::Result<()> {
     ip(&["link", "set", &cfg.iface, "up"])?;
     // Overlay-scoped route ONLY. Never 0.0.0.0/0.
     ip(&["route", "add", &cfg.overlay_cidr, "dev", &cfg.iface])?;
-    // IPv6 overlay address + route (fd88::/48), derived from the node's index
+    // IPv6 overlay address + route (fd88::/48), derived from the node\'s index
     // (100.88.0.N ↔ fd88::N). Best-effort — IPv6 may be disabled on the host.
     let idx6 = u32::from(cfg.overlay_ip).wrapping_sub(u32::from(akurai_common::OVERLAY_IPV4_NET));
     let ip6 = akurai_common::OverlayIpv6::from_index(idx6 as u64).addr();
@@ -208,20 +216,28 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let sock = Arc::new(UdpSocket::bind(("0.0.0.0", 0))?);
     let relay = cfg.relay;
     let table: Arc<Mutex<Table>> = Arc::new(Mutex::new(HashMap::new()));
-    let peers = Arc::new(cfg.peers);
+    let control_url = cfg.control_url;
+    let cookie_jar = cfg.cookie_jar;
+    let peers: Arc<RwLock<Arc<PeerTable>>> =
+        Arc::new(RwLock::new(Arc::new(cfg.peers)));
     let kp = Arc::new(cfg.keypair);
     let my_ip = cfg.overlay_ip;
     // ACL is consulted only on the outbound (TUN→UDP) path, which runs on this
     // thread, so it need not be shared with the UDP pump.
     let acl = cfg.acl;
 
-    // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer's
-    // overlay IP, served on the node's own overlay IP:53.
+    // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer\'s
+    // overlay IP, served on the node\'s own overlay IP:53.
     {
         let dns_peers = Arc::clone(&peers);
         let bind = SocketAddr::from((my_ip, 53));
         thread::spawn(move || {
-            let _ = akurai_dns::serve(bind, "akurai", move |label| dns_peers.resolve_name(label));
+            let _ = akurai_dns::serve(bind, "akurai", move |label| {
+                // Take a short read lock, clone the inner Arc, then operate
+                // lock-free so DNS resolution never blocks the refresh writer.
+                let pt = { Arc::clone(&*dns_peers.read().unwrap()) };
+                pt.resolve_name(label)
+            });
         });
     }
 
@@ -251,6 +267,22 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
         });
     }
 
+    // Peer-map refresh: every 30 s, re-fetch the control-plane peer map and
+    // hot-swap the shared table if the result is non-empty. An empty or failed
+    // fetch leaves the existing table untouched — we never wipe peers on error.
+    if let (Some(url), Some(jar)) = (control_url, cookie_jar) {
+        let peers_rw = Arc::clone(&peers);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(30));
+            let fetched = PeerTable::fetch(&url, &jar);
+            let n = fetched.len();
+            if n > 0 {
+                *peers_rw.write().unwrap() = Arc::new(fetched);
+                eprintln!("akurai-node: peers refreshed — {n} peer(s)");
+            }
+        });
+    }
+
     let pump = Pump {
         tun,
         sock,
@@ -271,7 +303,7 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
 }
 
 /// Read packets from the TUN, encrypt to the routing peer (initiating a handshake
-/// via the relay on first contact), and send `Data` frames on the peer's current
+/// via the relay on first contact), and send `Data` frames on the peer\'s current
 /// path (direct if confirmed, else the relay).
 fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
     let Pump {
@@ -305,10 +337,13 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
             }
             _ => continue,
         };
+        // Snapshot the current peer table for this iteration: hold the read lock
+        // only long enough to clone the inner Arc, then release it before any I/O.
+        let pt = { Arc::clone(&*peers.read().unwrap()) };
         // Route to the carrying peer: an exact overlay peer (v4 or derived v6), or
         // the gateway peer advertising the subnet `dest` falls in. The session is
-        // keyed by the PEER's overlay IPv4, so all of a peer's traffic shares it.
-        let Some(peer) = peers.route_to_ip(dest) else {
+        // keyed by the PEER\'s overlay IPv4, so all of a peer\'s traffic shares it.
+        let Some(peer) = pt.route_to_ip(dest) else {
             continue; // fail-closed: no peer/route for this destination
         };
         // Fine-grained ACL gate (fail-closed): if enforcement is on and this
@@ -330,6 +365,8 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
         }
         let peer_ip = peer.overlay_ip;
         let peer_pub = peer.public_key;
+        // pt (and the peer borrow) are no longer needed past this point.
+        drop(pt);
 
         let mut out: Option<(Vec<u8>, SocketAddr)> = None;
         {
@@ -358,7 +395,7 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
 
 /// Receive frames: confirm direct paths, complete handshakes, act on `PeerAddr`
 /// hints, or decrypt `Data` and write the inner packet to the TUN. Survives
-/// malformed datagrams (continues).
+/// transient recv errors (logs once, sleeps 100 ms, continues).
 fn udp_pump(pump: Pump) {
     let Pump {
         tun,
@@ -374,15 +411,25 @@ fn udp_pump(pump: Pump) {
         let (n, from) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
+            Err(e) => {
+                // Transient error (e.g. EAGAIN / ENETDOWN): log, back off briefly,
+                // and retry — never kill the receive path on a recoverable error.
+                eprintln!("akurai-node: udp recv error: {e} — retrying");
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
         };
         let Some(frame) = Frame::decode(&buf[..n]) else {
             continue;
         };
 
+        // Snapshot the current peer table for this iteration: hold the read lock
+        // only long enough to clone the inner Arc, then release it before any I/O.
+        let ptab = { Arc::clone(&*peers.read().unwrap()) };
+
         // A frame arriving straight from a known peer (not the relay) proves a
-        // working direct path — switch this peer's outbound path to it.
-        if from != relay && frame.kind != FrameKind::PeerAddr && peers.get(&frame.src).is_some() {
+        // working direct path — switch this peer\'s outbound path to it.
+        if from != relay && frame.kind != FrameKind::PeerAddr && ptab.get(&frame.src).is_some() {
             if let Ok(mut t) = table.lock() {
                 let st = t.entry(frame.src).or_default();
                 if st.direct.is_none() {
@@ -397,7 +444,7 @@ fn udp_pump(pump: Pump) {
                 // The relay hints that peer `frame.src` is reachable at the payload
                 // address. Remember it and probe to open any NAT hole.
                 if let (Some(addr), true) =
-                    (parse_addr(&frame.payload), peers.get(&frame.src).is_some())
+                    (parse_addr(&frame.payload), ptab.get(&frame.src).is_some())
                 {
                     {
                         let mut t = table.lock().unwrap();
@@ -419,7 +466,7 @@ fn udp_pump(pump: Pump) {
             FrameKind::HandshakeInit => {
                 let Ok(eph) = rand32() else { continue };
                 if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
-                    match peers.get(&frame.src) {
+                    match ptab.get(&frame.src) {
                         Some(p) if p.public_key == init_pub => {
                             table.lock().unwrap().entry(frame.src).or_default().session =
                                 Some(Session::new(keys));
