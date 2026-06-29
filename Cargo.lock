@@ -27,9 +27,6 @@ version = "0.1.0"
 [[package]]
 name = "akurai-dns"
 version = "0.1.0"
-dependencies = [
- "akurai-common",
-]
 
 [[package]]
 name = "akurai-node"
