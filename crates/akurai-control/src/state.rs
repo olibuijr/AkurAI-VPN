@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::auth::SessionStore;
+use crate::heartbeat::Heartbeat;
 use crate::vpn_endpoint::VpnEndpoint;
 
 /// All mutable runtime state for the control plane.
@@ -19,6 +20,9 @@ pub struct AppState {
     pub pending_states: HashSet<String>,
     /// Per-session CSRF tokens for state-changing dashboard/API requests.
     pub csrf_tokens: HashMap<String, String>,
+    /// Per-node heartbeat liveness, keyed by node id. In-memory only — a node's
+    /// liveness is re-established by its next heartbeat after a restart.
+    pub heartbeats: HashMap<String, Heartbeat>,
 }
 
 impl AppState {
@@ -37,6 +41,7 @@ impl AppState {
             endpoints,
             pending_states: HashSet::new(),
             csrf_tokens: HashMap::new(),
+            heartbeats: HashMap::new(),
         }
     }
 }
