@@ -21,13 +21,11 @@
 //! Fail-closed: a packet to an unknown destination, or from an unverified peer, is dropped.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
-// Interface/route setup shells out to the OS CLI on Linux and macOS; the Windows
-// TUN path is a stub, so `Command` is unused there.
-#[cfg(not(target_os = "windows"))]
+// Interface/route setup shells out to the OS CLI on every platform: `ip`/`sysctl`
+// on Linux, `ifconfig`/`route` on macOS, `netsh` on Windows.
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -113,7 +111,7 @@ struct Pump {
 /// 32 bytes of OS entropy for an ephemeral handshake secret.
 fn rand32() -> io::Result<[u8; 32]> {
     let mut b = [0u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut b)?;
+    crate::rng::fill_random(&mut b)?;
     Ok(b)
 }
 
@@ -128,8 +126,8 @@ fn parse_addr(payload: &[u8]) -> Option<SocketAddr> {
 }
 
 /// Bring up the overlay interface. Platform-specific: Linux uses `ip`/`sysctl`,
-/// macOS uses `ifconfig`/`route`, Windows is a no-op (TUN is stubbed). `iface` is
-/// the REAL interface name (the requested name on Linux, the kernel-assigned
+/// macOS uses `ifconfig`/`route`, Windows uses `netsh`. `iface` is the REAL
+/// interface name (the requested name on Linux and Windows, the kernel-assigned
 /// `utunN` on macOS). NO default route is ever installed.
 ///
 /// Bring up the overlay interface on Linux: address, MTU, the overlay-only route,
@@ -256,9 +254,50 @@ fn setup_interface(cfg: &TunnelConfig, iface: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Windows interface setup is a no-op while the TUN data plane is stubbed.
+/// Bring up the overlay interface on Windows via `netsh`: assign the overlay IPv4
+/// address with the `/16` overlay mask and add the overlay-only route over the
+/// Wintun adapter. `iface` is the Wintun adapter name — the requested name (Wintun
+/// honors it, unlike macOS's kernel-assigned `utunN`). The Linux-only gateway bits
+/// are intentionally omitted — this is the client path. NO default route is
+/// installed.
 #[cfg(target_os = "windows")]
-fn setup_interface(_cfg: &TunnelConfig, _iface: &str) -> io::Result<()> {
+fn setup_interface(cfg: &TunnelConfig, iface: &str) -> io::Result<()> {
+    let ip = cfg.overlay_ip.to_string();
+    // Static overlay address with the 255.255.0.0 (/16) overlay mask.
+    let status = Command::new("netsh")
+        .args([
+            "interface",
+            "ip",
+            "set",
+            "address",
+            &format!("name={iface}"),
+            "static",
+            &ip,
+            "255.255.0.0",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "`netsh interface ip set address name={iface} static {ip} 255.255.0.0` failed"
+        )));
+    }
+    // Overlay-scoped route ONLY over the Wintun adapter. Never a default route.
+    let status = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv4",
+            "add",
+            "route",
+            &cfg.overlay_cidr,
+            iface,
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "`netsh interface ipv4 add route {} {iface}` failed",
+            cfg.overlay_cidr
+        )));
+    }
     Ok(())
 }
 

@@ -6,7 +6,7 @@
 //! control plane records and peers use to open a Noise_IK session to this node.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -24,7 +24,8 @@ impl Identity {
     ///
     /// Idempotent: if `key_path` already holds a valid secret, it is reused
     /// (the public key is therefore stable across restarts). A new key is 32
-    /// bytes of `/dev/urandom`, written `0600`.
+    /// bytes of OS entropy (`/dev/urandom` on Unix, `BCryptGenRandom` on
+    /// Windows), written `0600`.
     pub fn load_or_create(key_path: &Path, pub_path: &Path) -> io::Result<Self> {
         if let Ok(existing) = fs::read_to_string(key_path) {
             let secret = b64::decode_array::<32>(existing.trim()).ok_or_else(|| {
@@ -36,7 +37,7 @@ impl Identity {
         }
 
         let mut secret = [0u8; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        crate::rng::fill_random(&mut secret)?;
         let keypair = Keypair::from_secret(secret);
 
         if let Some(parent) = key_path.parent() {

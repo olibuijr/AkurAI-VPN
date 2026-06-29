@@ -10,8 +10,9 @@
 //! - **macOS** — a real `utun` interface via raw `extern "C"` libSystem calls
 //!   (always linked — never a crate dependency); the 4-byte utun AF header is
 //!   added/stripped internally so callers still see bare packets.
-//! - **Windows** — a clearly-bounded stub that compiles and fails loudly until
-//!   the Wintun driver is wired (see [`tun`]).
+//! - **Windows** — a real Wintun interface via `wintun.dll`, loaded at runtime
+//!   with `LoadLibraryW`/`GetProcAddress` (no crate dependency); Wintun frames are
+//!   already bare IP, so packets pass straight through (see [`tun`]).
 //!
 //! Above this crate, packet I/O is [`TunDevice::recv`]/[`TunDevice::send`],
 //! interface/route setup is the OS CLI via [`std::process::Command`], and the

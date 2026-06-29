@@ -11,6 +11,7 @@ mod heartbeat;
 mod identity;
 mod peermap;
 mod peers;
+mod rng;
 mod tun;
 mod tunnel;
 

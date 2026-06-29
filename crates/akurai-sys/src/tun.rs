@@ -13,11 +13,14 @@
 //!   libSystem (always linked, never a crate dependency). utun frames carry a
 //!   4-byte big-endian address-family header, which this module adds on `send` and
 //!   strips on `recv`, so callers still see bare packets.
-//! - **Windows** — a clearly-bounded stub that COMPILES but fails loudly at
-//!   runtime until the Wintun driver is wired (see the `windows` module below).
+//! - **Windows** — a REAL Wintun interface: `wintun.dll` is loaded at runtime via
+//!   `LoadLibraryW`/`GetProcAddress` (no crate dependency), an adapter + ring
+//!   session are created, and `recv`/`send` shuttle packets through the ring.
+//!   Wintun frames are already bare IP (no AF header, unlike utun).
 //!
-//! The kernel-assigned name (`utunN` on macOS) is exposed via [`TunDevice::name`]
-//! so the caller can configure the right interface.
+//! The interface name is exposed via [`TunDevice::name`] so the caller can
+//! configure the right interface — the requested name on Linux and Windows, the
+//! kernel-assigned `utunN` on macOS.
 
 use std::io;
 
@@ -337,57 +340,286 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
-// Windows — compiling stub. Fails loudly until the Wintun driver is wired.
+// Windows — a real Wintun interface via runtime-loaded `wintun.dll` (no crate).
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 mod platform {
-    //! Windows TUN — NOT yet wired.
+    //! Windows `utun`-equivalent data plane on the Wintun driver.
     //!
-    //! A real implementation rides the Wintun driver (`wintun.dll`), loaded at
-    //! runtime with no crate dependency:
+    //! IMPLEMENTED. `wintun.dll` is loaded at runtime — no crate dependency, no
+    //! import-time link to wintun — preserving the zero-dependency promise:
     //!
-    //! 1. `LoadLibraryW(L"wintun.dll")` then `GetProcAddress` for the exports.
-    //! 2. `WintunCreateAdapter(name, "AkurAI", &guid)` to make the adapter.
-    //! 3. `WintunStartSession(adapter, capacity)` to get a ring-buffer session.
-    //! 4. `recv` -> `WintunReceivePacket` (+ `WintunReleaseReceivePacket`);
-    //!    `send` -> `WintunAllocateSendPacket` + memcpy + `WintunSendPacket`.
-    //!    Wintun packets are already bare IP — no 4-byte AF header (unlike utun).
+    //! 1. `LoadLibraryW(L"wintun.dll")` then `GetProcAddress` for every export.
+    //! 2. `WintunCreateAdapter(name, "AkurAI", NULL)` to make the adapter.
+    //! 3. `WintunStartSession(adapter, 4 MiB)` to get a ring-buffer session.
+    //! 4. `recv` -> `WintunReceivePacket` (+ `WintunReleaseReceivePacket`),
+    //!    blocking on `WintunGetReadWaitEvent` via `WaitForSingleObject` when the
+    //!    ring is empty; `send` -> `WintunAllocateSendPacket` + memcpy +
+    //!    `WintunSendPacket`. Wintun packets are already bare IP — no 4-byte AF
+    //!    header (unlike utun), so packets pass straight through.
     //! 5. Drop -> `WintunEndSession` + `WintunCloseAdapter`.
     //!
-    //! Until then, every call returns `ErrorKind::Unsupported` so the boundary is
-    //! explicit and the daemon fails fast rather than silently misbehaving.
+    //! Only `kernel32` (`LoadLibraryW`/`GetProcAddress`/`GetLastError`/
+    //! `WaitForSingleObject`) is statically imported — that is the bootstrap that
+    //! cannot itself be dynamically loaded. Everything Wintun is resolved by name.
 
+    use core::ffi::c_void;
     use std::io;
 
-    /// Placeholder handle. Never constructed (`create` always errors) — present so
-    /// the node compiles on Windows with the platform gap made explicit.
-    pub struct TunDevice {
-        _private: (),
+    /// Wintun ring capacity: 4 MiB (must be a power of two between 128 KiB and 64
+    /// MiB per the Wintun API).
+    const WINTUN_RING_CAPACITY: u32 = 0x0040_0000;
+    /// `WaitForSingleObject` — wait with no timeout.
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    /// `GetLastError`: the receive ring is currently empty (block on the event).
+    const ERROR_NO_MORE_ITEMS: u32 = 259;
+    /// `GetLastError`: the send ring is full (back-pressure → `WouldBlock`).
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    // --- Wintun exported function-pointer types (all `__stdcall` = extern system).
+    /// Opaque `WINTUN_ADAPTER_HANDLE` / `WINTUN_SESSION_HANDLE` / `HANDLE`.
+    type Handle = *mut c_void;
+    /// `WINTUN_ADAPTER_HANDLE WintunCreateAdapter(LPCWSTR, LPCWSTR, const GUID*)`.
+    type WintunCreateAdapterFn =
+        unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> Handle;
+    /// `void WintunCloseAdapter(WINTUN_ADAPTER_HANDLE)`.
+    type WintunCloseAdapterFn = unsafe extern "system" fn(Handle);
+    /// `WINTUN_SESSION_HANDLE WintunStartSession(WINTUN_ADAPTER_HANDLE, DWORD)`.
+    type WintunStartSessionFn = unsafe extern "system" fn(Handle, u32) -> Handle;
+    /// `void WintunEndSession(WINTUN_SESSION_HANDLE)`.
+    type WintunEndSessionFn = unsafe extern "system" fn(Handle);
+    /// `BYTE* WintunAllocateSendPacket(WINTUN_SESSION_HANDLE, DWORD)`.
+    type WintunAllocateSendPacketFn = unsafe extern "system" fn(Handle, u32) -> *mut u8;
+    /// `void WintunSendPacket(WINTUN_SESSION_HANDLE, const BYTE*)`.
+    type WintunSendPacketFn = unsafe extern "system" fn(Handle, *const u8);
+    /// `BYTE* WintunReceivePacket(WINTUN_SESSION_HANDLE, DWORD* PacketSize)`.
+    type WintunReceivePacketFn = unsafe extern "system" fn(Handle, *mut u32) -> *mut u8;
+    /// `void WintunReleaseReceivePacket(WINTUN_SESSION_HANDLE, const BYTE*)`.
+    type WintunReleaseReceivePacketFn = unsafe extern "system" fn(Handle, *const u8);
+    /// `HANDLE WintunGetReadWaitEvent(WINTUN_SESSION_HANDLE)`.
+    type WintunGetReadWaitEventFn = unsafe extern "system" fn(Handle) -> Handle;
+
+    // kernel32 — the irreducible static imports. `LoadLibraryW`/`GetProcAddress`
+    // cannot themselves be dynamically loaded (chicken-and-egg), so they, plus the
+    // error/wait helpers, are linked directly. Everything Wintun goes through them.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
+        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: u32) -> u32;
     }
 
-    /// The single error every stubbed entry point returns.
-    fn unsupported() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Windows TUN requires the Wintun driver — not yet wired",
-        )
+    /// The resolved Wintun entry points for one loaded `wintun.dll`.
+    struct Wintun {
+        create_adapter: WintunCreateAdapterFn,
+        close_adapter: WintunCloseAdapterFn,
+        start_session: WintunStartSessionFn,
+        end_session: WintunEndSessionFn,
+        allocate_send_packet: WintunAllocateSendPacketFn,
+        send_packet: WintunSendPacketFn,
+        receive_packet: WintunReceivePacketFn,
+        release_receive_packet: WintunReleaseReceivePacketFn,
+        get_read_wait_event: WintunGetReadWaitEventFn,
+    }
+
+    /// Resolve one Wintun export by name and transmute it to its typed fn pointer,
+    /// returning `Unsupported` from the enclosing function if the export is absent
+    /// (an old or incomplete `wintun.dll`). Must be expanded inside an `unsafe`
+    /// block — `GetProcAddress` and `transmute` are unsafe.
+    macro_rules! load_sym {
+        ($module:expr, $name:literal, $ty:ty) => {{
+            let sym = GetProcAddress($module, concat!($name, "\0").as_ptr());
+            if sym.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    concat!("wintun.dll is missing export ", $name),
+                ));
+            }
+            core::mem::transmute::<*mut c_void, $ty>(sym)
+        }};
+    }
+
+    /// A Windows layer-3 interface backed by a Wintun ring session. Holds the raw
+    /// adapter + session handles, the read-ready event, the requested name, and the
+    /// resolved Wintun entry points.
+    pub struct TunDevice {
+        adapter: Handle,
+        session: Handle,
+        read_wait: Handle,
+        name: String,
+        api: Wintun,
+    }
+
+    // SAFETY: a Wintun session is documented as thread-safe for concurrent
+    // `WintunSendPacket` and `WintunReceivePacket` from different threads, so
+    // sharing one `TunDevice` across the send and receive pump threads (via `Arc`)
+    // is sound. The stored handles are process-stable pointers with no thread
+    // affinity, and the resolved fn pointers are immutable after `create`.
+    unsafe impl Send for TunDevice {}
+    unsafe impl Sync for TunDevice {}
+
+    /// UTF-16, NUL-terminated — the form `LoadLibraryW`/`WintunCreateAdapter` want.
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(core::iter::once(0)).collect()
     }
 
     impl TunDevice {
-        pub fn create(_name: &str) -> io::Result<TunDevice> {
-            Err(unsupported())
+        /// Create a real Wintun adapter named `name` (with tunnel type `AkurAI`) and
+        /// start a 4 MiB ring session. Unlike macOS, Wintun honors the requested
+        /// name, so [`TunDevice::name`] returns `name` and the caller configures
+        /// that interface.
+        ///
+        /// # Errors
+        /// Returns `ErrorKind::Unsupported` if `wintun.dll` cannot be loaded (driver
+        /// not installed) or is missing an export; otherwise surfaces the Win32
+        /// error from `WintunCreateAdapter`/`WintunStartSession`. Never panics.
+        pub fn create(name: &str) -> io::Result<TunDevice> {
+            let name_w = to_wide(name);
+            let tunnel_w = to_wide("AkurAI");
+            let dll_w = to_wide("wintun.dll");
+
+            // SAFETY: every call below is FFI into kernel32 / wintun.dll matching the
+            // documented signatures. The wide-string buffers outlive their calls,
+            // and every returned handle is null-checked before use.
+            unsafe {
+                let module = LoadLibraryW(dll_w.as_ptr());
+                if module.is_null() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "wintun.dll not found — install the Wintun driver",
+                    ));
+                }
+                let api = Wintun {
+                    create_adapter: load_sym!(module, "WintunCreateAdapter", WintunCreateAdapterFn),
+                    close_adapter: load_sym!(module, "WintunCloseAdapter", WintunCloseAdapterFn),
+                    start_session: load_sym!(module, "WintunStartSession", WintunStartSessionFn),
+                    end_session: load_sym!(module, "WintunEndSession", WintunEndSessionFn),
+                    allocate_send_packet: load_sym!(
+                        module,
+                        "WintunAllocateSendPacket",
+                        WintunAllocateSendPacketFn
+                    ),
+                    send_packet: load_sym!(module, "WintunSendPacket", WintunSendPacketFn),
+                    receive_packet: load_sym!(module, "WintunReceivePacket", WintunReceivePacketFn),
+                    release_receive_packet: load_sym!(
+                        module,
+                        "WintunReleaseReceivePacket",
+                        WintunReleaseReceivePacketFn
+                    ),
+                    get_read_wait_event: load_sym!(
+                        module,
+                        "WintunGetReadWaitEvent",
+                        WintunGetReadWaitEventFn
+                    ),
+                };
+
+                // NULL requested GUID ⇒ Wintun derives a stable GUID from the name.
+                let adapter =
+                    (api.create_adapter)(name_w.as_ptr(), tunnel_w.as_ptr(), core::ptr::null());
+                if adapter.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let session = (api.start_session)(adapter, WINTUN_RING_CAPACITY);
+                if session.is_null() {
+                    let err = io::Error::last_os_error();
+                    (api.close_adapter)(adapter);
+                    return Err(err);
+                }
+                let read_wait = (api.get_read_wait_event)(session);
+
+                Ok(TunDevice {
+                    adapter,
+                    session,
+                    read_wait,
+                    name: name.to_string(),
+                    api,
+                })
+            }
         }
 
-        pub fn recv(&self, _buf: &mut [u8]) -> io::Result<usize> {
-            Err(unsupported())
+        /// Read one bare IP packet from the ring. Blocks on the read-ready event
+        /// when the ring is empty, so this never busy-spins. `&self`-safe to call
+        /// concurrently with [`send`](TunDevice::send).
+        pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            loop {
+                let mut size: u32 = 0;
+                // SAFETY: `self.session` is a live Wintun session. `receive_packet`
+                // returns either a pointer to `size` readable bytes (released below)
+                // or NULL with a reason in `GetLastError`.
+                let pkt = unsafe { (self.api.receive_packet)(self.session, &mut size) };
+                if !pkt.is_null() {
+                    let n = (size as usize).min(buf.len());
+                    // SAFETY: `pkt` is valid for `size` bytes until we release it; we
+                    // copy `n <= size` into the caller's buffer (no overlap), then
+                    // hand the ring slot straight back.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(pkt, buf.as_mut_ptr(), n);
+                        (self.api.release_receive_packet)(self.session, pkt);
+                    }
+                    return Ok(n);
+                }
+                // SAFETY: kernel32 call, no pointer arguments.
+                let err = unsafe { GetLastError() };
+                if err == ERROR_NO_MORE_ITEMS {
+                    // SAFETY: `read_wait` is this session's read-ready event handle.
+                    unsafe { WaitForSingleObject(self.read_wait, INFINITE) };
+                    continue;
+                }
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
         }
 
-        pub fn send(&self, _pkt: &[u8]) -> io::Result<usize> {
-            Err(unsupported())
+        /// Write one bare IP packet into the send ring. Returns `WouldBlock` if the
+        /// ring is full. `&self`-safe to call concurrently with
+        /// [`recv`](TunDevice::recv).
+        pub fn send(&self, pkt: &[u8]) -> io::Result<usize> {
+            if pkt.is_empty() {
+                return Ok(0);
+            }
+            // SAFETY: `self.session` is live; `allocate_send_packet` returns a
+            // writable buffer of exactly `pkt.len()` bytes, or NULL with a reason in
+            // `GetLastError`.
+            let slot = unsafe { (self.api.allocate_send_packet)(self.session, pkt.len() as u32) };
+            if slot.is_null() {
+                // SAFETY: kernel32 call, no pointer arguments.
+                let err = unsafe { GetLastError() };
+                if err == ERROR_BUFFER_OVERFLOW {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "wintun send ring full",
+                    ));
+                }
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            // SAFETY: `slot` is `pkt.len()` writable bytes we own until handed to the
+            // ring by `send_packet`; source and destination do not overlap.
+            unsafe {
+                core::ptr::copy_nonoverlapping(pkt.as_ptr(), slot, pkt.len());
+                (self.api.send_packet)(self.session, slot);
+            }
+            Ok(pkt.len())
         }
 
+        /// The interface name — the requested name (Wintun honors it).
         pub fn name(&self) -> &str {
-            ""
+            &self.name
+        }
+    }
+
+    impl Drop for TunDevice {
+        fn drop(&mut self) {
+            // SAFETY: `session`/`adapter` came from `WintunStartSession`/
+            // `WintunCreateAdapter` and are still owned here; each is ended/closed
+            // exactly once, session before adapter (Wintun's required order).
+            unsafe {
+                if !self.session.is_null() {
+                    (self.api.end_session)(self.session);
+                }
+                if !self.adapter.is_null() {
+                    (self.api.close_adapter)(self.adapter);
+                }
+            }
         }
     }
 }
@@ -396,8 +628,9 @@ pub use platform::TunDevice;
 
 /// Create a layer-3 TUN interface named `name` and return a cross-platform handle.
 ///
-/// On Linux the kernel honors `name`; on macOS it assigns `utunN` (read it back via
-/// [`TunDevice::name`]); on Windows this currently returns `ErrorKind::Unsupported`.
+/// On Linux and Windows the requested `name` is honored; on macOS the kernel
+/// assigns `utunN` (read it back via [`TunDevice::name`]). On Windows a missing
+/// `wintun.dll` surfaces as `ErrorKind::Unsupported`.
 ///
 /// # Errors
 /// Surfaces the underlying OS error. Never panics.
