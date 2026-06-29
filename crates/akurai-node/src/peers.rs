@@ -17,7 +17,7 @@ use std::path::Path;
 use std::process::Command;
 
 use akurai_common::b64;
-use akurai_common::Cidr;
+use akurai_common::{Cidr, Principal, Tag};
 
 /// One reachable overlay peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,10 @@ pub struct Peer {
     /// packet whose destination falls in one of these is tunnelled to this peer,
     /// which forwards it to the real subnet behind it.
     pub advertised: Vec<Cidr>,
+    /// ACL tags this peer carries (MVP4 fine-grained ACLs). These are the
+    /// destination principals the policy evaluator matches a `tag:X -> tag:Y`
+    /// rule against. Empty ⇒ the peer matches only `tag:*` wildcard rules.
+    pub tags: Vec<Tag>,
 }
 
 /// Overlay-IP-indexed peer table.
@@ -48,6 +52,13 @@ impl PeerTable {
 
     pub fn get(&self, ip: &Ipv4Addr) -> Option<&Peer> {
         self.by_ip.get(ip)
+    }
+
+    /// The destination principals a peer presents to the ACL evaluator: its
+    /// tags as [`Principal::Tag`]. The `from` side of an evaluation is THIS
+    /// node's own principals (see `acl::Acl`).
+    pub fn peer_principals(peer: &Peer) -> Vec<Principal> {
+        peer.tags.iter().cloned().map(Principal::Tag).collect()
     }
 
     /// Resolve a destination IPv4 to the peer that should carry it: an exact
@@ -132,8 +143,14 @@ impl PeerTable {
     }
 }
 
-/// Parse a static peers file: one `<overlay_ip> <pubkey_b64> [name]` per line.
-/// Blank lines and `#` comments are ignored; unparseable lines are skipped.
+/// Parse a static peers file: one
+/// `<overlay_ip> <pubkey_b64> [name] [advertised] [tags]` per line, e.g.
+/// `100.88.0.3 <pubkey> nodeb 192.168.50.0/24 tag:server,tag:trusted`.
+/// The 4th field is comma-separated advertised CIDRs (`-` or any non-CIDR
+/// token ⇒ none, which lets a tagged peer with no subnets keep the 5th field
+/// positional). The 5th field is comma-separated ACL tags (`tag:` prefix
+/// optional). Blank lines and `#` comments are ignored; unparseable lines are
+/// skipped.
 pub fn parse_peers_file(content: &str) -> Vec<Peer> {
     let mut peers = Vec::new();
     for line in content.lines() {
@@ -151,16 +168,31 @@ pub fn parse_peers_file(content: &str) -> Vec<Peer> {
             .next()
             .map(|s| s.split(',').filter_map(parse_cidr).collect())
             .unwrap_or_default();
+        // Optional 5th field: comma-separated ACL tags.
+        let tags = parts.next().map(parse_tags).unwrap_or_default();
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
                 advertised,
+                tags,
             });
         }
     }
     peers
+}
+
+/// Parse a comma-separated ACL tag list (`tag:server,tag:trusted`, or bare
+/// `server,trusted`) into [`Tag`]s, stripping an optional `tag:` prefix and
+/// dropping empty entries.
+pub fn parse_tags(s: &str) -> Vec<Tag> {
+    s.split(',')
+        .filter_map(|t| {
+            let name = t.trim().strip_prefix("tag:").unwrap_or(t.trim()).trim();
+            (!name.is_empty()).then(|| Tag(name.to_string()))
+        })
+        .collect()
 }
 
 /// Parse a CIDR like `192.168.50.0/24` into an [`akurai_common::Cidr`].
@@ -191,12 +223,18 @@ pub fn parse_peermap_json(json: &str) -> Vec<Peer> {
         let advertised = json_str_field(obj, "advertised")
             .map(|s| s.split(',').filter_map(parse_cidr).collect())
             .unwrap_or_default();
+        // Likewise an optional comma-separated "tags" field for fine-grained
+        // ACLs; absent → untagged.
+        let tags = json_str_field(obj, "tags")
+            .map(|s| parse_tags(&s))
+            .unwrap_or_default();
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(&pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
                 advertised,
+                tags,
             });
         }
     }
@@ -262,6 +300,7 @@ mod tests {
             public_key: pk(1),
             name: "b".into(),
             advertised: vec![],
+            tags: vec![],
         }]);
         assert!(t.get(&Ipv4Addr::new(100, 88, 0, 3)).is_some());
         assert!(t.get(&Ipv4Addr::new(100, 88, 0, 9)).is_none());
@@ -284,6 +323,7 @@ mod tests {
             public_key: pk(1),
             name: "gw".into(),
             advertised: vec![parse_cidr("192.168.50.0/24").unwrap()],
+            tags: vec![],
         }]);
         // Exact overlay IP.
         assert_eq!(
@@ -298,5 +338,44 @@ mod tests {
         // Outside any subnet / overlay → fail-closed.
         assert!(t.route_to(&Ipv4Addr::new(8, 8, 8, 8)).is_none());
         assert_eq!(t.advertised_routes().len(), 1);
+    }
+
+    #[test]
+    fn parses_peer_tags() {
+        let pk_b64 = b64::encode(&pk(4));
+        // 5th field tags, alongside an advertised subnet in the 4th.
+        let with_subnet = parse_peers_file(&format!(
+            "100.88.0.3 {pk_b64} srv 192.168.50.0/24 tag:server,tag:trusted\n"
+        ));
+        assert_eq!(with_subnet[0].advertised.len(), 1);
+        assert_eq!(
+            with_subnet[0].tags,
+            vec![Tag("server".into()), Tag("trusted".into())]
+        );
+        // Tags with no advertised subnets: `-` placeholder keeps the field positional.
+        let no_subnet = parse_peers_file(&format!("100.88.0.4 {pk_b64} ws - tag:workstation\n"));
+        assert!(no_subnet[0].advertised.is_empty());
+        assert_eq!(no_subnet[0].tags, vec![Tag("workstation".into())]);
+        // No 5th field → untagged.
+        let bare = parse_peers_file(&format!("100.88.0.5 {pk_b64} bare\n"));
+        assert!(bare[0].tags.is_empty());
+    }
+
+    #[test]
+    fn peer_principals_are_tag_principals() {
+        let p = Peer {
+            overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
+            public_key: pk(1),
+            name: "x".into(),
+            advertised: vec![],
+            tags: vec![Tag("server".into()), Tag("trusted".into())],
+        };
+        assert_eq!(
+            PeerTable::peer_principals(&p),
+            vec![
+                Principal::Tag(Tag("server".into())),
+                Principal::Tag(Tag("trusted".into())),
+            ]
+        );
     }
 }

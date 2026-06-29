@@ -5,6 +5,7 @@
 //! subnet routes, exit routes, or gateway advertisements. Command dispatch is
 //! parsed from `std::env::args` by hand to keep the zero-dependency promise.
 
+mod acl;
 mod error;
 mod identity;
 mod peermap;
@@ -130,7 +131,10 @@ fn up(args: &[String]) -> Result<(), NodeError> {
 ///
 /// Flags: `--overlay-ip <ip>` (required), `--relay <host:port>` (required),
 /// `--peers <file>` (default `<home>/config/peers`), `--iface <name>`
-/// (default `akurai0`), `--mtu <n>` (default overlay MTU).
+/// (default `akurai0`), `--mtu <n>` (default overlay MTU),
+/// `--acl <file>` (default `<home>/config/acl`; enforced only if it exists),
+/// `--my-tags tag:a,tag:b` (this node's ACL principals; also `my_tags` in
+/// `network.conf`).
 fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     let dirs = NodeDirs::new(node_home(args)?);
     dirs.create()?;
@@ -193,6 +197,26 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     // Full-tunnel exit node opt-in (MVP2): `--exit-node <peer-overlay-ip>`.
     let exit_node: Option<Ipv4Addr> = from("--exit-node", "exit_node").and_then(|s| s.parse().ok());
 
+    // Fine-grained ACL (MVP4). Default file `<home>/config/acl`. If it exists,
+    // enforce it (fail-closed `this-node → peer`); if not, preserve today's
+    // network-membership-only behavior (every peer in the map is reachable).
+    let acl_path = arg_value(args, "--acl")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.config.join("acl"));
+    let my_principals = from("--my-tags", "my_tags")
+        .map(|s| acl::parse_my_principals(&s))
+        .unwrap_or_default();
+    let acl = if acl_path.exists() {
+        eprintln!(
+            "{NAME}: ACL enforcement ON — {} ({} principal(s) for this node)",
+            acl_path.display(),
+            my_principals.len()
+        );
+        Some(acl::Acl::load(&acl_path, my_principals))
+    } else {
+        None
+    };
+
     let overlay_cidr = format!(
         "{}/{}",
         akurai_common::OVERLAY_IPV4_NET,
@@ -213,6 +237,7 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         peers,
         advertise,
         exit_node,
+        acl,
     };
     tunnel::run(cfg)?;
     Ok(())
@@ -347,6 +372,8 @@ fn print_usage() {
     println!("    up [--auth-key <key>] [--overlay-ip <ip>]");
     println!("                            Enable host-only membership (no routing)");
     println!("    tunnel [--home <p>]     Run the encrypted mesh daemon (reads network.conf)");
+    println!("           [--acl <file>] [--my-tags tag:a,tag:b]");
+    println!("                            Enforce a fail-closed tag ACL when the file exists");
     println!("    service-install         Install + start the systemd tunnel service (root)");
     println!("    down                    Disable host-only membership");
     println!("    status                  Show local node status");
