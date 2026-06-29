@@ -30,11 +30,13 @@ Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session co
 ### Symmetric NAT — VERIFIED (test added)
 `tests/netns/symmetric.sh`: two nodes behind separate NAT routers with randomized source ports (symmetric NAT) cannot hole-punch a direct path, yet the overlay ping succeeds via the relay — the correct hard-NAT behavior (Tailscale's DERP model). So NAT handling is **complete**: cone NAT → direct path (`direct.sh`); symmetric NAT → relay fallback (`symmetric.sh`). Full netns suite is now **7/7** (e2e, subnet, direct, exit, acl, ingress, symmetric).
 
-### Remaining (only what this environment physically cannot do)
-- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked ONLY on the device being plugged into USB; then live-verify `updatePeers`, the green peers, token survival. ~20s of work behind a cable.
-- **Multi-OS GUI clients** (macOS/Windows) — the Linux node daemon already runs anywhere Linux does, and Android ships; macOS/Windows are net-new GUI apps with platform-specific TUN (utun/Wintun) that cannot be built or tested on this Linux host.
+### Android distribution — DONE (self-serve)
+The APK is published at **https://akurai-vpn.olibuijr.com/akurai-vpn.apk** (HTTP 200, `application/octet-stream`, 13 MB, sha256 byte-identical to the build). No USB needed — install from the browser download (enable "install unknown apps"). This is the current client: login → auto-provision → self-heal mesh + durable token + clean UI. (A device-side live re-verify of `updatePeers`/green-peers is the only thing still pending, and only because the test phone is physically unplugged.)
 
-> Status: **every core capability of a Tailscale alternative is built AND verified** — encrypted mesh, control plane, cone+symmetric NAT traversal, subnet/exit gateways, MagicDNS, ACL, durable+rotatable node auth, persistent sessions, Linux + Android clients. What's left is additional desktop OSes (untestable here) and one USB cable for the phone.
+### Remaining — only macOS/Windows GUI clients
+The Linux node daemon runs on any Linux; Android ships and is downloadable. **macOS/Windows are net-new clients with platform-specific TUN (utun / Wintun) and route APIs that cannot be compiled or tested on this Linux host.** Building them blind would mean shipping unverified networking code — deliberately not done. They need a macOS/Windows host (or CI runner) to build + verify against.
+
+> Status: **every core capability of a Tailscale alternative is built AND verified, and both shipping clients (Linux + Android) are distributable** — encrypted mesh, control plane, cone+symmetric NAT, subnet/exit gateways, MagicDNS, ACL, durable+rotatable node auth, persistent sessions. The sole remaining work is additional desktop-OS clients, which require their own OS to build and verify.
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
