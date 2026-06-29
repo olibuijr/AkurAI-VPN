@@ -15,6 +15,8 @@
 //! | POST   | /api/endpoints/add            | Yes   | Add endpoint (HTML form POST)        |
 //! | POST   | /api/endpoints/:id/delete     | Yes   | Delete endpoint (HTML form)          |
 //! | DELETE | /api/endpoints/:id            | Yes   | Delete endpoint (REST)               |
+//! | GET    | /api/peermap                  | Yes   | JSON peer view (`?self=<id>` excl.)  |
+//! | POST   | /api/heartbeat                | Yes   | Record node liveness (JSON body)     |
 //!
 //! **Auth**: protected routes require a valid `akurai_session` cookie.
 //! Missing or unknown tokens redirect to `/login`.
@@ -300,6 +302,18 @@ fn route(req: &Request, state: &SharedState) -> Response {
             };
             handle_list_endpoints(&user, state)
         }
+        (Method::Get, "/api/peermap") => {
+            let Some(user) = require_auth(req, state) else {
+                return Response::redirect("/login");
+            };
+            handle_peermap(req, &user, state)
+        }
+        (Method::Post, "/api/heartbeat") => {
+            let Some(user) = require_auth(req, state) else {
+                return Response::redirect("/login");
+            };
+            handle_heartbeat(req, &user, state)
+        }
         (Method::Post, "/api/endpoints") => {
             let Some(user) = require_auth(req, state) else {
                 return Response::redirect("/login");
@@ -470,6 +484,66 @@ fn handle_list_endpoints(session: &AuthSession, state: &SharedState) -> Response
         })
         .unwrap_or_default();
     Response::ok_json(format!("[{json}]\n"))
+}
+
+/// `GET /api/peermap` — the caller's peers (their own nodes minus the requesting
+/// node, identified by an optional `?self=<node_id>`), each with overlay IPv4,
+/// public key, name, and liveness. Generation is delegated to [`peermap`] so the
+/// pure mapping logic stays unit-testable without an HTTP request.
+fn handle_peermap(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+    let params = parse_query(&req.query);
+    let self_id = params.get("self").map(String::as_str);
+    let st = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    let now = crate::vpn_endpoint::now_secs();
+    let json = peermap::build_peermap_json(
+        &st.endpoints,
+        &st.heartbeats,
+        &session.user.email,
+        self_id,
+        now,
+    );
+    Response::ok_json(json)
+}
+
+/// `POST /api/heartbeat` — record liveness for one of the caller's own nodes.
+///
+/// Body carries the node `id` and an optional reported `endpoint` (UDP socket
+/// addr). The heartbeat is accepted only when `id` names an endpoint owned by
+/// the authenticated user; an unknown or foreign id returns 404 so a caller
+/// cannot probe for, or forge liveness on, other tenants' nodes.
+fn handle_heartbeat(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::bad_request("invalid csrf token");
+    }
+    let id = auth::extract_json_str(&req.body, "id").unwrap_or_default();
+    if id.is_empty() {
+        return Response::bad_request("id is required");
+    }
+    let endpoint = auth::extract_json_str(&req.body, "endpoint").unwrap_or_default();
+
+    let mut st = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    let owned = st
+        .endpoints
+        .iter()
+        .any(|e| e.id == id && e.added_by == session.user.email);
+    if !owned {
+        return Response::not_found();
+    }
+    let last_seen = crate::vpn_endpoint::now_secs();
+    st.heartbeats.insert(
+        id,
+        heartbeat::Heartbeat {
+            endpoint,
+            last_seen,
+        },
+    );
+    Response::ok_json("{\"ok\":true}\n".to_string())
 }
 
 fn add_endpoint_json(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
@@ -961,5 +1035,135 @@ mod tests {
         let response = delete_endpoint("other", &session, &req, &state);
         assert_eq!(response.status, "404 Not Found");
         assert_eq!(state.lock().unwrap().endpoints.len(), 1);
+    }
+
+    // -- peer map + heartbeat ------------------------------------------------
+
+    fn session_for(email: &str) -> AuthSession {
+        AuthSession {
+            user: AuthUser {
+                sub: "sub".to_string(),
+                email: email.to_string(),
+                name: "User".to_string(),
+            },
+            csrf_token: "csrf".to_string(),
+        }
+    }
+
+    fn ep(id: &str, added_by: &str, allowed: &[&str]) -> crate::vpn_endpoint::VpnEndpoint {
+        crate::vpn_endpoint::VpnEndpoint {
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            public_key: format!("pk-{id}"),
+            endpoint_addr: String::new(),
+            allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+            added_by: added_by.to_string(),
+            added_at: 1,
+        }
+    }
+
+    #[test]
+    fn heartbeat_records_endpoint_and_timestamp_for_owned_node() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints
+                .push(ep("mine", "user@example.com", &["100.88.0.2/32"]));
+        }
+        let session = session_for("user@example.com");
+        let req = request(
+            &[("x-csrf-token", "csrf")],
+            r#"{"id":"mine","endpoint":"203.0.113.9:51820"}"#,
+        );
+        let resp = handle_heartbeat(&req, &session, &state);
+        assert_eq!(resp.status, "200 OK");
+        assert!(resp.body.contains("\"ok\":true"));
+
+        let st = state.lock().unwrap();
+        let hb = st.heartbeats.get("mine").expect("heartbeat recorded");
+        assert_eq!(hb.endpoint, "203.0.113.9:51820");
+        assert!(hb.last_seen > 0, "timestamp stamped on record");
+    }
+
+    #[test]
+    fn heartbeat_rejects_node_not_owned_by_user() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints
+                .push(ep("other", "other@example.com", &["100.88.0.2/32"]));
+        }
+        let session = session_for("user@example.com");
+        let req = request(
+            &[("x-csrf-token", "csrf")],
+            r#"{"id":"other","endpoint":"203.0.113.9:51820"}"#,
+        );
+        let resp = handle_heartbeat(&req, &session, &state);
+        assert_eq!(resp.status, "404 Not Found");
+        // No liveness was forged for a node the caller does not own.
+        assert!(state.lock().unwrap().heartbeats.is_empty());
+    }
+
+    #[test]
+    fn peermap_handler_excludes_self_query_param() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints
+                .push(ep("self-node", "user@example.com", &["100.88.0.2/32"]));
+            st.endpoints
+                .push(ep("peer-node", "user@example.com", &["100.88.0.3/32"]));
+        }
+        let session = session_for("user@example.com");
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: "self=self-node".to_string(),
+            headers: std::collections::HashMap::new(),
+            body: String::new(),
+        };
+        let resp = handle_peermap(&req, &session, &state);
+        assert_eq!(resp.status, "200 OK");
+        // The node named by ?self= is excluded; the peer is present.
+        assert!(!resp.body.contains("name-self-node"));
+        assert!(!resp.body.contains("100.88.0.2"));
+        assert!(resp.body.contains("name-peer-node"));
+        assert!(resp.body.contains("\"overlay_ipv4\":\"100.88.0.3\""));
+        assert!(resp.body.contains("\"public_key\":\"pk-peer-node\""));
+    }
+
+    #[test]
+    fn peermap_handler_is_scoped_to_user_and_reports_liveness() {
+        let state = crate::state::new_shared();
+        let now = crate::vpn_endpoint::now_secs();
+        {
+            let mut st = state.lock().unwrap();
+            st.endpoints
+                .push(ep("mine", "user@example.com", &["100.88.0.2/32"]));
+            st.endpoints
+                .push(ep("theirs", "other@example.com", &["100.88.0.3/32"]));
+            // Fresh heartbeat for the owned node -> online true.
+            st.heartbeats.insert(
+                "mine".to_string(),
+                heartbeat::Heartbeat {
+                    endpoint: "203.0.113.9:51820".to_string(),
+                    last_seen: now,
+                },
+            );
+        }
+        let session = session_for("user@example.com");
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: std::collections::HashMap::new(),
+            body: String::new(),
+        };
+        let resp = handle_peermap(&req, &session, &state);
+        assert!(resp.body.contains("name-mine"));
+        assert!(resp.body.contains("\"online\":true"));
+        // Another tenant's node is never disclosed.
+        assert!(!resp.body.contains("name-theirs"));
+        assert!(!resp.body.contains("100.88.0.3"));
     }
 }
