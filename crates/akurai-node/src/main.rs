@@ -7,6 +7,7 @@
 
 mod acl;
 mod error;
+mod heartbeat;
 mod identity;
 mod peermap;
 mod peers;
@@ -227,6 +228,11 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         peers.len(),
         id.public_b64()
     );
+    // Report liveness to the control plane so peers see this node ONLINE.
+    if let Some(control) = from("--control", "control") {
+        heartbeat::spawn(control, dirs.config.join("cookies.txt"), id.public_b64());
+    }
+
     let cfg = tunnel::TunnelConfig {
         iface,
         overlay_ip,
