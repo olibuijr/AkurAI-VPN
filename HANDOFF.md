@@ -4,6 +4,38 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Update — 2026-06-29 (v0.1.0): WORKING ENCRYPTED MESH DATA PLANE (MVP1) — live
+
+The VPN now actually tunnels traffic. A node brings up `akurai0`, and one enrolled device can `ping` another over the `100.88.0.0/16` overlay, carried as end-to-end ChaCha20-Poly1305 ciphertext, hub-routed through the relay (which holds no keys). **Proven end-to-end** in Linux netns locally AND against the live deployed relay on EC2.
+
+### What was built (all pure-Rust, zero external deps)
+- **`akurai-sys`** (new crate): creates the `akurai0` TUN via a single isolated `ioctl(TUNSETIFF)` raw syscall — the only unsafe in the data plane. All other I/O is safe std.
+- **`akurai-common`**: relay `frame` codec (envelope `[AC01][ver][type][dst v4][src v4][len][payload]`) + `b64`.
+- **`akurai-node`**: X25519 identity (gen/persist 0600, idempotent); `tunnel` daemon = TUN + UDP + Noise_IK sessions + TUN↔UDP pump; peer table (static file OR curl-fetched `/api/peermap`); brings up the overlay with a `100.88.0.0/16`-ONLY route (never a default route).
+- **`akurai-relay`**: ciphertext-only forward hub — learns each node's UDP endpoint from frame sources, forwards by destination overlay IP, decrypts nothing.
+- **`akurai-control`**: `GET /api/peermap` + `POST /api/heartbeat` (authenticated, user-scoped, TTL liveness); node records now carry the real X25519 pubkey.
+- **`tests/netns/e2e.sh`**: the end-to-end proof (encrypted ping + ciphertext-on-underlay + fail-closed-drop).
+
+### Live state
+- **Control plane** v0.1.0 — vpn.olibuijr.com (`/api/peermap`, `/api/heartbeat` live, validate 11/11).
+- **Relay** v0.1.0 — EC2 systemd `akurai-vpn-relay.service`, UDP `0.0.0.0:51820`. **GOTCHA (fixed): the host runs `ufw` with INPUT policy DROP — the AWS security-group rule alone was NOT enough; the relay was unreachable until `sudo ufw allow 51820/udp` on the box. Both the SG and ufw must allow the relay port.**
+- **Installer + node binary 0.1.0** — published to akurai-vpn.olibuijr.com; installer registers the real identity pubkey, writes relay config, and prints the `sudo akurai-node tunnel …` start command.
+
+### Safety held
+All multi-node verification ran in network namespaces; the host (`midget`) default route on `wlan0` was never touched, no `akurai0` ever appeared in the host namespace. The overlay TUN installs ONLY `100.88.0.0/16`, never `0.0.0.0/0`.
+
+### Remaining roadmap toward a "complete Tailscale alternative" (NOT yet built)
+1. **MVP3 — direct peer mesh / NAT traversal** (currently hub-routed only): endpoint discovery, UDP hole-punching, path health, relay fallback.
+2. **MVP2 — gateway routes**: subnet advertise + admin approval + client route push; exit-gateway opt-in (default-route — careful: this is where host-route risk lives).
+3. **MagicDNS**: resolve `node.user.akurai` → overlay IP (akurai-dns is still a stub).
+4. **ACL enforcement in the data path**: the fail-closed policy model exists in `akurai-common::policy` but is not yet wired into the node pump or relay.
+5. **Production daemon**: a privileged systemd `akurai-node tunnel` service auto-installed by the installer (needs root/CAP_NET_ADMIN); session rekey/expiry; roaming.
+6. **Multi-OS clients** (Android/Termux per the plan); IPv6 overlay data path.
+
+ISA for this wave: `~/.claude/PAI/MEMORY/WORK/akurai-vpn-dataplane/ISA.md`.
+
+---
+
 ## Update — 2026-06-28 (v0.0.9): overlay IP allocation shipped
 
 The "next milestone" decision below was made and implemented: **per-node overlay IP allocation (IPAM)**. It was the only one of the three options with zero `wlan0` risk (pure control-plane bookkeeping) and is the prerequisite for any future data plane.
