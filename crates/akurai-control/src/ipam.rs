@@ -159,6 +159,7 @@ mod tests {
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
             added_by: "u@example.com".to_string(),
             added_at: 0,
+            node_token: String::new(),
         }
     }
 

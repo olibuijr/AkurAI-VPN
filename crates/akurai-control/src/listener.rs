@@ -303,16 +303,39 @@ fn route(req: &Request, state: &SharedState) -> Response {
             handle_list_endpoints(&user, state)
         }
         (Method::Get, "/api/peermap") => {
-            let Some(user) = require_auth(req, state) else {
-                return Response::redirect("/login");
-            };
-            handle_peermap(req, &user, state)
+            if let Some(session) = require_auth(req, state) {
+                handle_peermap(req, &session, state)
+            } else if let Some((user, _ep_id)) = auth_node(req, state) {
+                // Token-auth: build a synthetic AuthSession (csrf_token unused for peermap).
+                let session = AuthSession {
+                    user,
+                    csrf_token: String::new(),
+                };
+                handle_peermap(req, &session, state)
+            } else {
+                Response {
+                    status: "401 Unauthorized",
+                    content_type: "application/json",
+                    extra: vec![],
+                    body: r#"{"error":"unauthorized"}"#.to_string(),
+                }
+            }
         }
         (Method::Post, "/api/heartbeat") => {
-            let Some(user) = require_auth(req, state) else {
-                return Response::redirect("/login");
-            };
-            handle_heartbeat(req, &user, state)
+            if let Some(session) = require_auth(req, state) {
+                // Cookie-auth path: CSRF enforced inside handle_heartbeat.
+                handle_heartbeat(req, &session, state)
+            } else if let Some((user, ep_id)) = auth_node(req, state) {
+                // Token-auth path: CSRF skipped; id may be backfilled from token.
+                handle_heartbeat_token(req, &user, &ep_id, state)
+            } else {
+                Response {
+                    status: "401 Unauthorized",
+                    content_type: "application/json",
+                    extra: vec![],
+                    body: r#"{"error":"unauthorized"}"#.to_string(),
+                }
+            }
         }
         (Method::Post, "/api/endpoints") => {
             let Some(user) = require_auth(req, state) else {
@@ -649,6 +672,7 @@ fn do_add_endpoint(
         allowed_ips,
         added_by: user.email.clone(),
         added_at: now_secs(),
+        node_token: crate::vpn_endpoint::generate_node_token(),
     };
     let id = ep.id.clone();
     let overlay_ipv4 = crate::ipam::overlay_addr_string(&ep.allowed_ips).unwrap_or_default();
@@ -720,6 +744,101 @@ fn csrf_from_request(req: &Request) -> Option<String> {
         .get("x-csrf-token")
         .cloned()
         .or_else(|| auth::parse_form(&req.body).get("csrf_token").cloned())
+}
+
+// ---------------------------------------------------------------------------
+// Node-token auth helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the bearer token from an `Authorization: Bearer <t>` header or a
+/// `X-Node-Token: <t>` header. Returns `None` when neither is present.
+fn node_token_from_req(req: &Request) -> Option<String> {
+    if let Some(auth_hdr) = req.headers.get("authorization") {
+        if let Some(rest) = auth_hdr.strip_prefix("Bearer ") {
+            let t = rest.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    if let Some(t) = req.headers.get("x-node-token") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Authenticate a request via a durable node token.
+///
+/// Returns `(AuthUser, endpoint_id)` when the presented token matches a
+/// registered endpoint. A non-empty token that matches no endpoint returns
+/// `None`. An empty `node_token` field never matches (pre-backfill records
+/// that haven't been upgraded yet).
+fn auth_node(req: &Request, state: &SharedState) -> Option<(AuthUser, String)> {
+    let token = node_token_from_req(req)?;
+    let st = state.lock().ok()?;
+    let ep = st
+        .endpoints
+        .iter()
+        .find(|e| !e.node_token.is_empty() && e.node_token == token)?;
+    let user = auth::AuthUser {
+        sub: ep.added_by.clone(),
+        email: ep.added_by.clone(),
+        name: String::new(),
+    };
+    Some((user, ep.id.clone()))
+}
+
+/// `POST /api/heartbeat` — node-token auth variant.
+///
+/// CSRF is skipped because the bearer token IS the long-term credential.
+/// If the JSON body carries an empty `"id"` field, the token's own endpoint id
+/// is used — so always-on daemons need not know their own id at startup.
+/// The ownership invariant is preserved: the resolved user must own the
+/// heartbeated node.
+fn handle_heartbeat_token(
+    req: &Request,
+    user: &auth::AuthUser,
+    token_ep_id: &str,
+    state: &SharedState,
+) -> Response {
+    // Back-fill id from the token's own endpoint when the caller omits it.
+    let id = {
+        let body_id = auth::extract_json_str(&req.body, "id").unwrap_or_default();
+        if body_id.is_empty() {
+            token_ep_id.to_string()
+        } else {
+            body_id
+        }
+    };
+    if id.is_empty() {
+        return Response::bad_request("id is required");
+    }
+    let endpoint = auth::extract_json_str(&req.body, "endpoint").unwrap_or_default();
+
+    let mut st = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    // Ownership check: the resolved email must own the heartbeated node.
+    let owned = st
+        .endpoints
+        .iter()
+        .any(|e| e.id == id && e.added_by == user.email);
+    if !owned {
+        return Response::not_found();
+    }
+    let last_seen = crate::vpn_endpoint::now_secs();
+    st.heartbeats.insert(
+        id,
+        heartbeat::Heartbeat {
+            endpoint,
+            last_seen,
+        },
+    );
+    Response::ok_json("{\"ok\":true}\n".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1084,7 @@ mod tests {
             allowed_ips: vec!["100.88.0.2/32".to_string()],
             added_by: "user@example.com".to_string(),
             added_at: 1,
+            node_token: String::new(),
         };
         let html = render_dashboard(&user, "csrf", std::slice::from_ref(&ep));
         assert!(html.contains("Overlay IP: 100.88.0.2"));
@@ -984,6 +1104,7 @@ mod tests {
                 allowed_ips: Vec::new(),
                 added_by: "user@example.com".to_string(),
                 added_at: 1,
+                node_token: String::new(),
             });
             st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
                 id: "other".to_string(),
@@ -993,6 +1114,7 @@ mod tests {
                 allowed_ips: Vec::new(),
                 added_by: "other@example.com".to_string(),
                 added_at: 1,
+                node_token: String::new(),
             });
         }
         let session = AuthSession {
@@ -1021,6 +1143,7 @@ mod tests {
                 allowed_ips: Vec::new(),
                 added_by: "other@example.com".to_string(),
                 added_at: 1,
+                node_token: String::new(),
             });
         }
         let session = AuthSession {
@@ -1059,6 +1182,7 @@ mod tests {
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
             added_by: added_by.to_string(),
             added_at: 1,
+            node_token: String::new(),
         }
     }
 
@@ -1165,5 +1289,171 @@ mod tests {
         // Another tenant's node is never disclosed.
         assert!(!resp.body.contains("name-theirs"));
         assert!(!resp.body.contains("100.88.0.3"));
+    }
+
+    // -- node token auth -------------------------------------------------------
+
+    /// Tokens must start with `aknk_` and carry exactly 64 lowercase hex chars.
+    #[test]
+    fn generate_node_token_has_correct_format() {
+        let t = crate::vpn_endpoint::generate_node_token();
+        assert!(t.starts_with("aknk_"), "prefix wrong: {t}");
+        assert_eq!(
+            t.len(),
+            5 + 64,
+            "expected 'aknk_' + 64 hex chars (len {}), got: {t}",
+            5 + 64
+        );
+        assert!(
+            t[5..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "non-lowercase-hex in token: {t}"
+        );
+    }
+
+    /// `auth_node` resolves a bearer token to its owning `AuthUser` and endpoint id.
+    #[test]
+    fn auth_node_resolves_token_to_owner() {
+        let state = crate::state::new_shared();
+        let tok = "aknk_".to_string() + &"ab".repeat(32); // 5 + 64 chars
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            st.endpoints.push(my_ep);
+        }
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            body: String::new(),
+        };
+        let result = auth_node(&req, &state);
+        assert!(result.is_some(), "expected auth_node to succeed");
+        let (user, ep_id) = result.unwrap();
+        assert_eq!(user.email, "user@example.com");
+        assert_eq!(ep_id, "mine");
+    }
+
+    /// A token that matches no endpoint returns `None`.
+    #[test]
+    fn auth_node_bogus_token_returns_none() {
+        let state = crate::state::new_shared();
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = "aknk_goodtoken".to_string();
+            st.endpoints.push(my_ep);
+        }
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), "Bearer aknk_bogus".to_string())]
+                .into_iter()
+                .collect(),
+            body: String::new(),
+        };
+        assert!(auth_node(&req, &state).is_none());
+    }
+
+    /// `GET /api/peermap` with a valid bearer token returns the user's own peers.
+    #[test]
+    fn peermap_via_token_header_returns_user_peers() {
+        let state = crate::state::new_shared();
+        let tok = "aknk_".to_string() + &"cc".repeat(32);
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            st.endpoints.push(my_ep);
+            // Another tenant's endpoint — must not appear.
+            st.endpoints
+                .push(ep("theirs", "other@example.com", &["100.88.0.3/32"]));
+        }
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            body: String::new(),
+        };
+        let resp = route(&req, &state);
+        assert_eq!(resp.status, "200 OK");
+        assert!(
+            resp.body.contains("name-mine"),
+            "own peer should be present"
+        );
+        assert!(
+            !resp.body.contains("name-theirs"),
+            "other tenant must not appear"
+        );
+    }
+
+    /// `POST /api/heartbeat` with a bearer token succeeds without a CSRF token
+    /// and records the node's liveness.
+    #[test]
+    fn heartbeat_via_token_no_csrf_marks_liveness() {
+        let state = crate::state::new_shared();
+        let tok = "aknk_".to_string() + &"dd".repeat(32);
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            st.endpoints.push(my_ep);
+        }
+        // No cookie, no CSRF header, no CSRF body field — only the bearer token.
+        let req = Request {
+            method: Method::Post,
+            path: "/api/heartbeat".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            body: r#"{"id":"mine","endpoint":"203.0.113.9:51820"}"#.to_string(),
+        };
+        let resp = route(&req, &state);
+        assert_eq!(resp.status, "200 OK");
+        assert!(resp.body.contains("\"ok\":true"));
+        let st = state.lock().unwrap();
+        let hb = st.heartbeats.get("mine").expect("heartbeat was recorded");
+        assert_eq!(hb.endpoint, "203.0.113.9:51820");
+        assert!(hb.last_seen > 0, "timestamp must be set");
+    }
+
+    /// When the JSON body carries an empty `"id"`, the token's own endpoint id
+    /// is used as the heartbeat target.
+    #[test]
+    fn heartbeat_via_token_backfills_id_when_empty() {
+        let state = crate::state::new_shared();
+        let tok = "aknk_".to_string() + &"ee".repeat(32);
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            st.endpoints.push(my_ep);
+        }
+        let req = Request {
+            method: Method::Post,
+            path: "/api/heartbeat".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            // Empty id — should be backfilled from the token's endpoint.
+            body: r#"{"id":"","endpoint":""}"#.to_string(),
+        };
+        let resp = route(&req, &state);
+        assert_eq!(resp.status, "200 OK");
+        assert!(
+            state.lock().unwrap().heartbeats.contains_key("mine"),
+            "id was backfilled from the token's endpoint"
+        );
     }
 }

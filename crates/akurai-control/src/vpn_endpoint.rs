@@ -20,6 +20,12 @@ pub struct VpnEndpoint {
     pub allowed_ips: Vec<String>,
     pub added_by: String,
     pub added_at: u64,
+    /// Durable node authentication token (prefix `aknk_` + 64 hex chars).
+    /// Generated at registration time and persisted alongside the endpoint
+    /// record. Nodes present this in `Authorization: Bearer` or `X-Node-Token`
+    /// to authenticate API calls without an active OIDC session cookie.
+    /// The empty string means "not yet assigned" (pre-backfill records).
+    pub node_token: String,
 }
 
 impl VpnEndpoint {
@@ -35,7 +41,7 @@ impl VpnEndpoint {
         format!(
             "{{\"id\":\"{}\",\"name\":\"{}\",\"public_key\":\"{}\",\
              \"endpoint\":\"{}\",\"overlay_ipv4\":\"{}\",\"allowed_ips\":[{}],\
-             \"added_by\":\"{}\",\"added_at\":{}}}",
+             \"added_by\":\"{}\",\"added_at\":{},\"node_token\":\"{}\"}}",
             json_esc(&self.id),
             json_esc(&self.name),
             json_esc(&self.public_key),
@@ -44,6 +50,7 @@ impl VpnEndpoint {
             ips,
             json_esc(&self.added_by),
             self.added_at,
+            json_esc(&self.node_token),
         )
     }
 }
@@ -116,6 +123,20 @@ pub fn random_id() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Generate a durable node authentication token: the prefix `"aknk_"` followed
+/// by 64 lowercase hex characters (32 bytes / 128 bits of `/dev/urandom` entropy).
+///
+/// Example: `aknk_3f2a1b8c…` (total length 69 characters).
+pub fn generate_node_token() -> String {
+    use std::io::Read as IoRead;
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    format!("aknk_{hex}")
+}
+
 /// Current UNIX timestamp in seconds.
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -174,6 +195,9 @@ fn parse_object(obj: &str) -> Option<VpnEndpoint> {
         allowed_ips: crate::auth::extract_json_str_array(obj, "allowed_ips"),
         added_by: crate::auth::extract_json_str(obj, "added_by").unwrap_or_default(),
         added_at: obj_u64(obj, "added_at"),
+        // Default to "" for records written before node tokens existed —
+        // AppState::new() backfills a fresh token and re-saves at startup.
+        node_token: crate::auth::extract_json_str(obj, "node_token").unwrap_or_default(),
     })
 }
 

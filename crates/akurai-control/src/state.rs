@@ -36,6 +36,23 @@ impl AppState {
                 eprintln!("akurai-control: failed to persist backfilled overlay IPs: {e}");
             }
         }
+
+        // Backfill: assign a durable node token to any endpoint enrolled before
+        // token authentication existed. Persisted so nodes can bootstrap their
+        // token on the next restart without a new OIDC login.
+        let mut tokens_assigned = 0usize;
+        for ep in &mut endpoints {
+            if ep.node_token.is_empty() {
+                ep.node_token = crate::vpn_endpoint::generate_node_token();
+                tokens_assigned += 1;
+            }
+        }
+        if tokens_assigned > 0 {
+            if let Err(e) = crate::vpn_endpoint::save(&endpoints) {
+                eprintln!("akurai-control: failed to persist backfilled node tokens: {e}");
+            }
+        }
+
         Self {
             sessions: SessionStore::new(),
             endpoints,

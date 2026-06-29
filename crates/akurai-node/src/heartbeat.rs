@@ -2,8 +2,16 @@
 //!
 //! While the tunnel is up, the node periodically POSTs `/api/heartbeat` so the
 //! control plane marks it ONLINE and peers see it as connected (the green dot in
-//! the clients). Uses `curl` with the saved session cookie — pure-std has no TLS
-//! client, and the node already shells to `curl` for the peer map.
+//! the clients). Two auth paths:
+//!
+//! - **Token path** (preferred): uses a durable `Authorization: Bearer` node
+//!   token. No CSRF fetch, no session expiry. Used when a `node.token` file
+//!   exists (written at first boot or bootstrapped from the OIDC cookie).
+//! - **Cookie path** (fallback): fetches a fresh CSRF token from the dashboard
+//!   HTML, then POSTs the heartbeat with the session cookie + CSRF header.
+//!   Active until a node token is acquired.
+//!
+//! Both paths use `curl` — pure-std has no TLS client.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,17 +79,81 @@ fn beat(control_url: &str, cookie_jar: &Path, node_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Spawn the background heartbeat loop. No-op (with a notice) if the node id
-/// can't be resolved (e.g. no `--control`/cookie configured).
-pub fn spawn(control_url: String, cookie_jar: PathBuf, pubkey_b64: String) {
+/// Resolve this node's control-plane id using a durable node bearer token.
+/// Preferred over [`fetch_node_id`] when a token is available.
+pub fn fetch_node_id_with_token(
+    control_url: &str,
+    token: &str,
+    pubkey_b64: &str,
+) -> Option<String> {
+    let base = control_url.trim_end_matches('/');
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            &format!("{base}/api/endpoints"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json = String::from_utf8_lossy(&out.stdout);
+    json.split('}')
+        .find(|obj| obj.contains(pubkey_b64))
+        .and_then(|obj| json_field(obj, "id"))
+}
+
+/// POST a single heartbeat using a bearer token — no CSRF fetch required.
+fn beat_with_token(control_url: &str, token: &str, node_id: &str) -> bool {
+    let base = control_url.trim_end_matches('/');
+    Command::new("curl")
+        .args([
+            "-fsS",
+            "-o",
+            "/dev/null",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            "-H",
+            "Content-Type: application/json",
+            "--data",
+            &format!("{{\"id\":\"{node_id}\",\"endpoint\":\"\"}}"),
+            &format!("{base}/api/heartbeat"),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn the background heartbeat loop.
+///
+/// When `node_token` is `Some`, uses bearer-token auth (no CSRF overhead,
+/// survives session-cookie expiry). When `None`, falls back to the cookie +
+/// CSRF dance. No-op (with a notice) if the node id cannot be resolved.
+pub fn spawn(
+    control_url: String,
+    cookie_jar: PathBuf,
+    pubkey_b64: String,
+    node_token: Option<String>,
+) {
     thread::spawn(move || {
-        let Some(id) = fetch_node_id(&control_url, &cookie_jar, &pubkey_b64) else {
+        let id = if let Some(ref tok) = node_token {
+            fetch_node_id_with_token(&control_url, tok, &pubkey_b64)
+        } else {
+            fetch_node_id(&control_url, &cookie_jar, &pubkey_b64)
+        };
+        let Some(id) = id else {
             eprintln!("akurai-node: heartbeat disabled — could not resolve this node's id");
             return;
         };
         eprintln!("akurai-node: heartbeat to {control_url} as node {id}");
         loop {
-            let _ = beat(&control_url, &cookie_jar, &id);
+            if let Some(ref tok) = node_token {
+                let _ = beat_with_token(&control_url, tok, &id);
+            } else {
+                let _ = beat(&control_url, &cookie_jar, &id);
+            }
             thread::sleep(HEARTBEAT_INTERVAL);
         }
     });

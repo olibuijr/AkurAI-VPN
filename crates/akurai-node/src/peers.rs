@@ -141,6 +141,27 @@ impl PeerTable {
             _ => Self::default(),
         }
     }
+
+    /// Fetch from the control plane's `/api/peermap` via `curl` with a durable
+    /// node bearer token. Preferred over [`PeerTable::fetch`] when a token is
+    /// available — the request does not depend on an unexpired session cookie.
+    /// Returns an empty table on any curl/parse failure.
+    pub fn fetch_with_token(control_url: &str, token: &str) -> Self {
+        let out = Command::new("curl")
+            .args([
+                "-fsSL",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                &format!("{}/api/peermap", control_url.trim_end_matches('/')),
+            ])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                Self::from_peers(parse_peermap_json(&String::from_utf8_lossy(&o.stdout)))
+            }
+            _ => Self::default(),
+        }
+    }
 }
 
 /// Parse a static peers file: one

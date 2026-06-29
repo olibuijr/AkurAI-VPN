@@ -61,9 +61,14 @@ pub struct TunnelConfig {
     /// When `Some`, a background thread fetches every 30 s and hot-swaps the
     /// peer table. `None` ⇒ no refresh (static file or one-shot fetch only).
     pub control_url: Option<String>,
-    /// Cookie jar path passed to `curl` for authenticated control-plane requests.
-    /// Paired with `control_url`; both must be `Some` to enable the refresh thread.
+    /// Cookie jar path passed to `curl` for cookie-authenticated control-plane
+    /// requests. Used only when `node_token` is `None`.
     pub cookie_jar: Option<PathBuf>,
+    /// Durable node token for bearer-token auth (`Authorization: Bearer <t>`).
+    /// When `Some`, the peer-map refresh thread uses bearer auth instead of the
+    /// session cookie — so the refresh survives cookie expiry. `None` ⇒ fall
+    /// back to cookie-jar auth (requires a valid session cookie).
+    pub node_token: Option<String>,
 }
 
 /// Per-peer session + path state, shared between the pump threads.
@@ -218,8 +223,8 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     let table: Arc<Mutex<Table>> = Arc::new(Mutex::new(HashMap::new()));
     let control_url = cfg.control_url;
     let cookie_jar = cfg.cookie_jar;
-    let peers: Arc<RwLock<Arc<PeerTable>>> =
-        Arc::new(RwLock::new(Arc::new(cfg.peers)));
+    let node_token = cfg.node_token;
+    let peers: Arc<RwLock<Arc<PeerTable>>> = Arc::new(RwLock::new(Arc::new(cfg.peers)));
     let kp = Arc::new(cfg.keypair);
     let my_ip = cfg.overlay_ip;
     // ACL is consulted only on the outbound (TUN→UDP) path, which runs on this
@@ -270,11 +275,19 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     // Peer-map refresh: every 30 s, re-fetch the control-plane peer map and
     // hot-swap the shared table if the result is non-empty. An empty or failed
     // fetch leaves the existing table untouched — we never wipe peers on error.
-    if let (Some(url), Some(jar)) = (control_url, cookie_jar) {
+    // When a node token is available, use bearer-token auth so the refresh
+    // survives cookie expiry; otherwise fall back to the cookie jar.
+    if let Some(url) = control_url {
         let peers_rw = Arc::clone(&peers);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(30));
-            let fetched = PeerTable::fetch(&url, &jar);
+            let fetched = if let Some(ref tok) = node_token {
+                PeerTable::fetch_with_token(&url, tok)
+            } else if let Some(ref jar) = cookie_jar {
+                PeerTable::fetch(&url, jar)
+            } else {
+                PeerTable::default()
+            };
             let n = fetched.len();
             if n > 0 {
                 *peers_rw.write().unwrap() = Arc::new(fetched);

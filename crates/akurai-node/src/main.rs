@@ -174,11 +174,29 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     let peers_path = arg_value(args, "--peers")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs.config.join("peers"));
-    // Source the peer map from the control plane (`--control <url>`, fetched via
-    // curl with the saved cookie jar) when available, else the static file.
+    // Self-bootstrap: load the durable node token from disk, or acquire it from
+    // the control plane via the saved OIDC session cookie and write it to disk
+    // so future restarts survive cookie expiry.  Falls back to None when no
+    // control URL is configured or the cookie jar is absent.
+    let node_token: Option<String> = from("--control", "control").and_then(|url| {
+        load_or_bootstrap_token(
+            &dirs.config.join("node.token"),
+            &url,
+            &dirs.config.join("cookies.txt"),
+            &id.public_b64(),
+        )
+    });
+
+    // Source the peer map from the control plane (`--control <url>`) when
+    // available.  Prefer the bearer token so the fetch survives cookie expiry;
+    // fall back to the cookie jar when no token is available yet.
     let peers = match from("--control", "control") {
         Some(url) => {
-            let fetched = peers::PeerTable::fetch(&url, &dirs.config.join("cookies.txt"));
+            let fetched = if let Some(ref tok) = node_token {
+                peers::PeerTable::fetch_with_token(&url, tok)
+            } else {
+                peers::PeerTable::fetch(&url, &dirs.config.join("cookies.txt"))
+            };
             if fetched.is_empty() {
                 peers::PeerTable::load_file(&peers_path)
             } else {
@@ -229,8 +247,15 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         id.public_b64()
     );
     // Report liveness to the control plane so peers see this node ONLINE.
+    // Pass the node token (if bootstrapped) so the heartbeat loop uses bearer
+    // auth and keeps working after the session cookie expires.
     if let Some(control) = from("--control", "control") {
-        heartbeat::spawn(control, dirs.config.join("cookies.txt"), id.public_b64());
+        heartbeat::spawn(
+            control,
+            dirs.config.join("cookies.txt"),
+            id.public_b64(),
+            node_token.clone(),
+        );
     }
 
     let cfg = tunnel::TunnelConfig {
@@ -246,6 +271,7 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         acl,
         control_url: from("--control", "control"),
         cookie_jar: Some(dirs.config.join("cookies.txt")),
+        node_token: node_token.clone(),
     };
     tunnel::run(cfg)?;
     Ok(())
@@ -477,6 +503,89 @@ fn write_file(path: &Path, content: &str) -> Result<(), NodeError> {
     }
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Node token self-bootstrap
+// ---------------------------------------------------------------------------
+
+/// Extract a `"key":"value"` string field from a JSON fragment (hand-rolled,
+/// no escapes in the values we care about — hex tokens, IDs, pubkeys).
+fn extract_json_str_field(obj: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = obj.find(&needle)? + needle.len();
+    let rest = obj[pos..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let v = rest[..end].to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Load the durable node token from `token_path`, or bootstrap it by calling
+/// the control plane's `/api/endpoints` with the saved session cookie, finding
+/// the endpoint whose `public_key` matches this node, and writing its
+/// `node_token` to `token_path` with 0600 permissions.
+///
+/// Returns `None` when neither source is available (first run without OIDC
+/// login, or control URL not configured).
+fn load_or_bootstrap_token(
+    token_path: &Path,
+    control_url: &str,
+    cookie_jar: &Path,
+    pubkey_b64: &str,
+) -> Option<String> {
+    // Fast path: token already on disk.
+    if let Ok(existing) = fs::read_to_string(token_path) {
+        let t = existing.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    // Bootstrap via the session cookie: fetch /api/endpoints, locate our
+    // endpoint by public key, extract node_token.
+    if !cookie_jar.exists() {
+        return None;
+    }
+    let base = control_url.trim_end_matches('/');
+    let out = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "-b",
+            &cookie_jar.to_string_lossy(),
+            &format!("{base}/api/endpoints"),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json = String::from_utf8_lossy(&out.stdout);
+    // Each JSON object is separated by `}`; find the one that contains our pubkey.
+    let token = json
+        .split('}')
+        .find(|obj| obj.contains(pubkey_b64))
+        .and_then(|obj| extract_json_str_field(obj, "node_token"))?;
+    // Persist with 0600 permissions so future restarts skip the cookie round-trip.
+    {
+        use std::io::Write as IoWrite;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        if let Ok(mut f) = opts.open(token_path) {
+            let _ = f.write_all(token.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+    }
+    eprintln!(
+        "{NAME}: node token bootstrapped and written to {}",
+        token_path.display()
+    );
+    Some(token)
 }
 
 #[cfg(test)]
