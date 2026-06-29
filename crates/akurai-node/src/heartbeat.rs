@@ -49,6 +49,8 @@ fn beat(control_url: &str, cookie_jar: &Path, node_id: &str) -> bool {
     let Some(csrf) = csrf else {
         return false;
     };
+    // The control plane expects a JSON body + the CSRF token in the X-CSRF-Token
+    // header (not a form field).
     Command::new("curl")
         .args([
             "-fsS",
@@ -56,12 +58,12 @@ fn beat(control_url: &str, cookie_jar: &Path, node_id: &str) -> bool {
             "/dev/null",
             "-b",
             &jar,
-            "--data-urlencode",
-            &format!("csrf_token={csrf}"),
-            "--data-urlencode",
-            &format!("id={node_id}"),
-            "--data-urlencode",
-            "endpoint=",
+            "-H",
+            &format!("X-CSRF-Token: {csrf}"),
+            "-H",
+            "Content-Type: application/json",
+            "--data",
+            &format!("{{\"id\":\"{node_id}\",\"endpoint\":\"\"}}"),
             &format!("{base}/api/heartbeat"),
         ])
         .status()
