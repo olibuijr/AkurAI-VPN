@@ -26,12 +26,18 @@ OVERLAY_PING · CIPHERTEXT · MAGICDNS · FAILCLOSED · SUBNET_GATEWAY · DIRECT
 2. **EC2 relay port**: host `ufw` INPUT-policy-DROP — the AWS SG rule alone is NOT enough; also `sudo ufw allow 51820/udp`.
 3. **Host safety**: all multi-node verification in netns; never bring a tunnel up in the host namespace.
 
+### Now ALSO done (this session, verified in netns, committed)
+- **MVP4 — public ingress**: new `akurai-ingress` crate (`serve --map <port>:<overlay_ip>:<target_port>`) — pure-std TCP proxy from a public port to an internal overlay service. Proof: `tests/netns/ingress.sh`.
+- **Fine-grained ACL enforcement** in the data path: peer tags (peers-file 5th field / peer map), a local `config/acl` policy, `--my-tags`, enforced fail-closed in `tun_pump` (denied flow dropped). `akurai-node/src/acl.rs` + `akurai-common::policy`. Proof: `tests/netns/acl.sh` (ALLOW + DENY).
+- **IPv6 overlay data path** (`fd88::/48`): node assigns `fd88::N` + routes it; `tun_pump` parses IPv6 + `peers.route_to_ip`. Proof: `e2e.sh` IPV6_CHECK (`ping -6 fd88::3`).
+- **Android client**: `~/Projects/AkurAI-VPN-Android` — Rust JNI backend (`rust/`, fd-based pump cdylib) + Kotlin `VpnService` app (`app/`), Tailscale-style. (Build/deploy in progress.)
+
+**Full regression now 6 tests / 11 checks: `sudo tests/netns/{e2e,subnet,direct,exit,acl,ingress}.sh` → ALL PASS.**
+
 ### Remaining toward 100% "complete" (honest roadmap)
-- **MVP4 — public ingress** (Funnel/Serve equivalent). NOT built.
-- **Fine-grained ACL enforcement in the data path** (`akurai-common::policy` exists, unwired beyond network-level fail-closed).
-- **IPv6 overlay data path** (`fd88::/48` defined; pump is IPv4-only).
 - **Control-plane endpoint distribution** for robust symmetric-NAT direct paths (relay PeerAddr handles cone NAT today).
-- **Production hardening**: session rekey/expiry, durable node auth token, native mobile/desktop apps.
+- **Production hardening**: session rekey/expiry, durable node auth token (peer-map fetch uses the OIDC cookie), key rotation.
+- **Android app polish**: device-test on hardware, identity registration with the control plane, multi-arch APK, Play-store packaging.
 
 ---
 
