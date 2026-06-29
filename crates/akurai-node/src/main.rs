@@ -12,9 +12,10 @@ mod peers;
 mod tun;
 mod tunnel;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -43,6 +44,7 @@ fn run(args: &[String]) -> Result<(), NodeError> {
         Some("install") => install(&args[1..]),
         Some("up") => up(&args[1..]),
         Some("tunnel") => tunnel_cmd(&args[1..]),
+        Some("service-install") => service_install(&args[1..]),
         Some("down") => down(),
         Some("status") => status(&args[1..]),
         Some("path") => {
@@ -137,15 +139,30 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         &dirs.config.join("identity.pub"),
     )?;
 
+    // network.conf (written by the installer) supplies overlay_ip/relay/control;
+    // explicit flags override it. This lets the systemd unit run a bare
+    // `tunnel --home <home>` with no arguments.
+    let conf = read_conf(&dirs.config.join("network.conf"));
+    let from = |flag: &str, key: &str| -> Option<String> {
+        arg_value(args, flag)
+            .map(str::to_string)
+            .or_else(|| conf.get(key).cloned())
+    };
+
     let iface = arg_value(args, "--iface").unwrap_or("akurai0").to_string();
-    let overlay_ip: Ipv4Addr = arg_value(args, "--overlay-ip")
-        .ok_or_else(|| NodeError::Usage("tunnel requires --overlay-ip <ip>".to_string()))?
+    let overlay_ip: Ipv4Addr = from("--overlay-ip", "overlay_ip")
+        .ok_or_else(|| NodeError::Usage("tunnel needs --overlay-ip <ip> (or network.conf)".into()))?
         .parse()
-        .map_err(|_| NodeError::Usage("invalid --overlay-ip".to_string()))?;
-    let relay: SocketAddr = arg_value(args, "--relay")
-        .ok_or_else(|| NodeError::Usage("tunnel requires --relay <host:port>".to_string()))?
-        .parse()
-        .map_err(|_| NodeError::Usage("invalid --relay (want host:port)".to_string()))?;
+        .map_err(|_| NodeError::Usage("invalid overlay ip".to_string()))?;
+    let relay_s = from("--relay", "relay").ok_or_else(|| {
+        NodeError::Usage("tunnel needs --relay <host:port> (or network.conf)".into())
+    })?;
+    // Resolve `host:port` via DNS — supports `vpn.olibuijr.com:51820`, not only IPs.
+    let relay: SocketAddr = relay_s
+        .to_socket_addrs()
+        .map_err(|e| NodeError::Usage(format!("cannot resolve relay '{relay_s}': {e}")))?
+        .next()
+        .ok_or_else(|| NodeError::Usage(format!("relay '{relay_s}' resolved to no address")))?;
     let mtu: u16 = arg_value(args, "--mtu")
         .and_then(|s| s.parse().ok())
         .unwrap_or(akurai_common::OVERLAY_MTU);
@@ -154,9 +171,9 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         .unwrap_or_else(|| dirs.config.join("peers"));
     // Source the peer map from the control plane (`--control <url>`, fetched via
     // curl with the saved cookie jar) when available, else the static file.
-    let peers = match arg_value(args, "--control") {
+    let peers = match from("--control", "control") {
         Some(url) => {
-            let fetched = peers::PeerTable::fetch(url, &dirs.config.join("cookies.txt"));
+            let fetched = peers::PeerTable::fetch(&url, &dirs.config.join("cookies.txt"));
             if fetched.is_empty() {
                 peers::PeerTable::load_file(&peers_path)
             } else {
@@ -196,6 +213,78 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     };
     tunnel::run(cfg)?;
     Ok(())
+}
+
+/// Render the systemd unit that runs the tunnel daemon at boot. The daemon reads
+/// `network.conf` for its parameters, so the unit needs no arguments beyond `--home`.
+fn render_tunnel_unit(bin: &Path, home: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=AkurAI VPN node tunnel (encrypted overlay mesh)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={bin} tunnel --home {home}\n\
+         Restart=on-failure\n\
+         RestartSec=3\n\
+         AmbientCapabilities=CAP_NET_ADMIN\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN\n\
+         NoNewPrivileges=yes\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        bin = bin.display(),
+        home = home.display(),
+    )
+}
+
+/// Install (and start) the systemd service that runs the tunnel at boot — the
+/// one-touch daemon. Requires root. `--dry-run` prints the unit instead of
+/// writing it (safe to run anywhere). The daemon reads `network.conf` written by
+/// the installer for its overlay IP / relay / control URL.
+fn service_install(args: &[String]) -> Result<(), NodeError> {
+    let dirs = NodeDirs::new(node_home(args)?);
+    let bin = dirs.bin.join(NAME);
+    let unit = render_tunnel_unit(&bin, &dirs.home);
+    let unit_path = Path::new("/etc/systemd/system/akurai-node-tunnel.service");
+
+    if args.iter().any(|a| a == "--dry-run") {
+        println!("# would write {}\n{unit}", unit_path.display());
+        return Ok(());
+    }
+    write_file(unit_path, &unit)?;
+    for sc in [
+        vec!["daemon-reload"],
+        vec!["enable", "--now", "akurai-node-tunnel.service"],
+    ] {
+        let status = std::process::Command::new("systemctl").args(&sc).status()?;
+        if !status.success() {
+            return Err(NodeError::Usage(format!(
+                "systemctl {} failed",
+                sc.join(" ")
+            )));
+        }
+    }
+    println!("{NAME}: tunnel service installed and started (akurai-node-tunnel.service)");
+    Ok(())
+}
+
+/// Read a simple `key=value` config file (e.g. `network.conf`). Missing file ⇒
+/// empty map. Blank lines and `#` comments ignored.
+fn read_conf(path: &Path) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Tear host-only membership down.
@@ -254,6 +343,8 @@ fn print_usage() {
     println!("    install                 Install into ~/.akurai-vpn by default");
     println!("    up [--auth-key <key>] [--overlay-ip <ip>]");
     println!("                            Enable host-only membership (no routing)");
+    println!("    tunnel [--home <p>]     Run the encrypted mesh daemon (reads network.conf)");
+    println!("    service-install         Install + start the systemd tunnel service (root)");
     println!("    down                    Disable host-only membership");
     println!("    status                  Show local node status");
     println!("    path                    Print the resolved AkurAI-VPN home");
