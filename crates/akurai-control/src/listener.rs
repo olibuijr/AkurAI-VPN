@@ -297,10 +297,19 @@ fn route(req: &Request, state: &SharedState) -> Response {
     // Authenticated REST / form routes
     match (req.method, path) {
         (Method::Get, "/api/endpoints") => {
-            let Some(user) = require_auth(req, state) else {
-                return Response::redirect("/login");
-            };
-            handle_list_endpoints(&user, state)
+            if let Some(session) = require_auth(req, state) {
+                handle_list_endpoints(&session, state)
+            } else if let Some((user, _ep_id)) = auth_node(req, state) {
+                // Token-auth: a node lists its owner's endpoints (used to resolve
+                // its own id + bootstrap). csrf_token unused for a GET.
+                let session = AuthSession {
+                    user,
+                    csrf_token: String::new(),
+                };
+                handle_list_endpoints(&session, state)
+            } else {
+                Response::redirect("/login")
+            }
         }
         (Method::Get, "/api/peermap") => {
             if let Some(session) = require_auth(req, state) {

@@ -138,14 +138,21 @@ pub fn spawn(
     node_token: Option<String>,
 ) {
     thread::spawn(move || {
-        let id = if let Some(ref tok) = node_token {
+        let resolved = if let Some(ref tok) = node_token {
             fetch_node_id_with_token(&control_url, tok, &pubkey_b64)
         } else {
             fetch_node_id(&control_url, &cookie_jar, &pubkey_b64)
         };
-        let Some(id) = id else {
-            eprintln!("akurai-node: heartbeat disabled — could not resolve this node's id");
-            return;
+        // With a token, the control plane backfills the id from the token's own
+        // endpoint when we send an empty one — so a failed id lookup is NOT fatal
+        // in token mode; we heartbeat with an empty id and let the server fill it.
+        let id = match (resolved, node_token.is_some()) {
+            (Some(id), _) => id,
+            (None, true) => String::new(),
+            (None, false) => {
+                eprintln!("akurai-node: heartbeat disabled — could not resolve this node's id");
+                return;
+            }
         };
         eprintln!("akurai-node: heartbeat to {control_url} as node {id}");
         loop {
