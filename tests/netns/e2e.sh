@@ -26,7 +26,7 @@ RC=0
 cleanup() {
   kill "${A_PID:-}" "${B_PID:-}" "${RELAY_PID:-}" "${TCPDUMP_PID:-}" 2>/dev/null
   for ns in akv-relay akv-a akv-b; do ip netns del "$ns" 2>/dev/null; done
-  rm -rf "$WORK"
+  rm -rf "$WORK" /etc/netns/akv-a
 }
 trap cleanup EXIT
 
@@ -116,7 +116,10 @@ if command -v tcpdump >/dev/null; then
 fi
 
 say "9b. MagicDNS: resolve and ping node B by name (nodeb.akurai)"
-ip netns exec akv-a sh -c 'printf "nameserver 100.88.0.2\n" > /etc/resolv.conf 2>/dev/null || true'
+# Per-netns resolv.conf via /etc/netns/<name>/ — ip-netns bind-mounts this over
+# /etc INSIDE the namespace, so the HOST's /etc/resolv.conf is never touched.
+mkdir -p /etc/netns/akv-a
+printf 'nameserver 100.88.0.2\n' > /etc/netns/akv-a/resolv.conf
 if ip netns exec akv-a ping -c 2 -W 2 nodeb.akurai >/dev/null 2>&1; then
   echo "MAGICDNS_CHECK: PASS (nodeb.akurai resolved + reachable)"
 else
