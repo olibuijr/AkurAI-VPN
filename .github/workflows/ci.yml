@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # The cryptographic + transport + protocol core is pure-std and must build AND
+  # pass its tests on every desktop OS — this is the cross-platform foundation a
+  # macOS/Windows client is built on.
+  portable-core:
+    name: portable core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build core crates
+        run: cargo build -p akurai-crypto -p akurai-transport -p akurai-common -p akurai-dns
+      - name: test core crates
+        run: cargo test -p akurai-crypto -p akurai-transport -p akurai-common -p akurai-dns
+
+  # Full workspace (incl. control plane + relay + Linux node) on Linux.
+  linux-full:
+    name: linux full workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  # Desktop node port — builds the client daemon on macOS + Windows. Marked
+  # continue-on-error until the utun/Wintun platform layer lands, so the run
+  # surfaces the exact platform gaps without blocking the rest of CI.
+  desktop-node:
+    name: desktop node (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build node
+        run: cargo build -p akurai-node
