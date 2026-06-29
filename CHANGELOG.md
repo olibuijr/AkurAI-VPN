@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-29
+
+### Fixed
+- accept node token on /api/endpoints; heartbeat tolerates token-backfilled id
+
+
+
 ## [0.3.0] - 2026-06-29
 
 ### Added
