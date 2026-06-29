@@ -441,11 +441,136 @@ pub fn selftest(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Transport-level echo peer: binds a UDP socket, connects to the relay, and
+/// for `secs` seconds:
+///   - responds to `HandshakeInit` from any peer in `cfg.peers`, storing a
+///     `Session` keyed by the peer's overlay IP;
+///   - decrypts `Data` frames, calls `icmp_echo_reply` on the inner packet, and
+///     returns the ICMP reply encrypted back to the sender via the relay;
+///   - sends `Keepalive` to the relay every 5 s so the relay learns our UDP endpoint.
+///
+/// No TUN device is opened — this is a pure-userspace overlay peer, so it
+/// compiles and runs on Linux, macOS, and Windows without any kernel privileges.
+pub fn echo_peer(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
+    eprintln!(
+        "akurai-node: echo-peer up — overlay {}, peer-echoing for {secs}s",
+        cfg.overlay_ip
+    );
+
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    // Short read timeout so the receive loop wakes up periodically to check the
+    // deadline, even when no frames arrive.
+    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let relay = cfg.relay;
+    let my_ip = cfg.overlay_ip;
+    let kp = cfg.keypair;
+    let peers = cfg.peers;
+
+    // Keepalive thread: 5 s cadence (faster than the tunnel's 15 s) so the relay
+    // records our UDP address quickly, before node A sends us a HandshakeInit.
+    {
+        let sock_ka = sock.try_clone()?;
+        thread::spawn(move || loop {
+            if let Some(f) = Frame::new(
+                FrameKind::Keepalive,
+                my_ip,
+                Ipv4Addr::UNSPECIFIED,
+                Vec::new(),
+            ) {
+                let _ = sock_ka.send_to(&f.encode(), relay);
+            }
+            thread::sleep(Duration::from_secs(5));
+        });
+    }
+
+    // Per-peer state on the main thread only — no sharing required.
+    let mut sessions: HashMap<Ipv4Addr, Session> = HashMap::new();
+    // In-flight initiators for any handshake *we* started (echo-peer is normally
+    // a pure responder, but we store any pending state so HandshakeResp is handled
+    // gracefully rather than silently dropped).
+    let mut pending: HashMap<Ipv4Addr, Initiator> = HashMap::new();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut buf = [0u8; 4096];
+
+    while std::time::Instant::now() < deadline {
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            // Timeout (WouldBlock on Unix, TimedOut on Windows) — loop to
+            // recheck the deadline.
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+
+        let Some(frame) = Frame::decode(&buf[..n]) else {
+            continue;
+        };
+
+        match frame.kind {
+            FrameKind::HandshakeInit => {
+                // Mirror udp_pump: respond only when the initiator's recovered
+                // static key matches the configured peer.
+                let Ok(eph) = rand32() else { continue };
+                if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
+                    match peers.get(&frame.src) {
+                        Some(p) if p.public_key == init_pub => {
+                            sessions.insert(frame.src, Session::new(keys));
+                            if let Some(reply) =
+                                Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
+                            {
+                                // Send on the arrival path (same as udp_pump).
+                                let _ = sock.send_to(&reply.encode(), from);
+                            }
+                        }
+                        _ => {} // unknown peer or mismatched key: drop
+                    }
+                }
+            }
+            FrameKind::HandshakeResp => {
+                // Complete any initiator we started (graceful, even though we
+                // normally do not initiate as echo-peer).
+                if let Some(state) = pending.remove(&frame.src) {
+                    if let Some(keys) = noise::finalize(state, &frame.payload) {
+                        sessions.insert(frame.src, Session::new(keys));
+                    }
+                }
+            }
+            FrameKind::Data => {
+                // Decrypt the inner IP packet; if it is an ICMP echo-request,
+                // encrypt the reply and send it back via the relay.
+                if let Some(sess) = sessions.get_mut(&frame.src) {
+                    if let Some(inner) = sess.decrypt(&frame.payload) {
+                        if let Some(reply_pkt) = icmp_echo_reply(&inner) {
+                            let ct = sess.encrypt(&reply_pkt);
+                            if let Some(reply_frame) =
+                                Frame::new(FrameKind::Data, my_ip, frame.src, ct)
+                            {
+                                let _ = sock.send_to(&reply_frame.encode(), relay);
+                                eprintln!("echo-peer answered ping from {}", frame.src);
+                            }
+                        }
+                    }
+                }
+            }
+            // PeerAddr hints and keepalives require no action from a pure responder.
+            FrameKind::PeerAddr | FrameKind::Keepalive => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// If `pkt` is an IPv4 ICMP echo *request*, build the matching echo *reply*
 /// (swap src/dst, type 8→0, recompute the ICMP checksum). The IPv4 header
 /// checksum is unchanged because swapping src↔dst leaves the 16-bit word sum
 /// invariant. Returns `None` for anything that is not an ICMP echo request.
-fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
     if pkt.len() < 28 || (pkt[0] >> 4) != 4 {
         return None; // need ≥20B IPv4 header + ≥8B ICMP; IPv4 only
     }
@@ -467,7 +592,7 @@ fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian words.
-fn checksum16(data: &[u8]) -> u16 {
+pub(crate) fn checksum16(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut i = 0;
     while i + 1 < data.len() {

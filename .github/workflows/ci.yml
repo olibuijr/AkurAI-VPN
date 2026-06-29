@@ -117,3 +117,70 @@ jobs:
           Get-Content smoke.log -ErrorAction SilentlyContinue
           if ($ok) { Write-Host "PASS: Windows Wintun recv+send move packets" }
           else { Write-Host "FAIL: no ICMP echo over Wintun"; exit 1 }
+
+  # Full ENCRYPTED end-to-end on a single real macOS/Windows host: a relay + a
+  # real `tunnel` node A (utun/Wintun) + a transport-level `echo-peer` node B
+  # (no TUN, so its overlay IP is never local → no kernel short-circuit). A ping
+  # to node B traverses A's full data plane (utun → Noise-encrypt → relay →
+  # decrypt by B → encrypted echo → A's utun). A reply proves the whole encrypted
+  # client path works at runtime on that OS.
+  e2e-desktop:
+    name: e2e encrypted (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build node + relay (release)
+        run: cargo build --release -p akurai-node -p akurai-relay
+      - name: macOS — encrypted ping A→B over the relay
+        if: runner.os == 'macOS'
+        run: |
+          BIN=./target/release/akurai-node
+          RELAY=./target/release/akurai-relay
+          "$BIN" install --home /tmp/a; "$BIN" install --home /tmp/b
+          APUB=$(cat /tmp/a/config/identity.pub); BPUB=$(cat /tmp/b/config/identity.pub)
+          echo "100.88.0.4 $BPUB nodeb" > /tmp/a/config/peers
+          echo "100.88.0.3 $APUB nodea" > /tmp/b/config/peers
+          RELAY_PORT=51820 "$RELAY" serve > relay.log 2>&1 &
+          sleep 1
+          "$BIN" echo-peer --home /tmp/b --overlay-ip 100.88.0.4 --relay 127.0.0.1:51820 --peers /tmp/b/config/peers --secs 40 > b.log 2>&1 &
+          sudo "$BIN" tunnel --home /tmp/a --overlay-ip 100.88.0.3 --relay 127.0.0.1:51820 --peers /tmp/a/config/peers > a.log 2>&1 &
+          APID=$!
+          sleep 6
+          echo "--- node A ---"; cat a.log; echo "--- echo-peer B ---"; cat b.log
+          echo "--- ENCRYPTED ping A→B (100.88.0.4) over the relay ---"
+          if ping -c 5 -t 10 100.88.0.4; then RESULT=0; else RESULT=1; fi
+          sudo kill "$APID" 2>/dev/null || true
+          echo "--- echo-peer B after ping ---"; cat b.log
+          [ $RESULT -eq 0 ] && echo "PASS: macOS encrypted end-to-end works" \
+            || { echo "FAIL: no encrypted round-trip"; cat relay.log; exit 1; }
+      - name: Windows — encrypted ping A→B over the relay
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun-extract -Force
+          Copy-Item wintun-extract/wintun/bin/amd64/wintun.dll target/release/wintun.dll
+          $BIN = "./target/release/akurai-node.exe"
+          & $BIN install --home C:\a; & $BIN install --home C:\b
+          $apub = Get-Content C:\a\config\identity.pub; $bpub = Get-Content C:\b\config\identity.pub
+          "100.88.0.4 $bpub nodeb" | Out-File -Encoding ascii C:\a\config\peers
+          "100.88.0.3 $apub nodea" | Out-File -Encoding ascii C:\b\config\peers
+          $env:RELAY_PORT="51820"
+          Start-Process ./target/release/akurai-relay.exe -ArgumentList "serve" -RedirectStandardError relay.log -PassThru -NoNewWindow | Out-Null
+          Start-Sleep 1
+          Start-Process $BIN -ArgumentList "echo-peer","--home","C:\b","--overlay-ip","100.88.0.4","--relay","127.0.0.1:51820","--peers","C:\b\config\peers","--secs","40" -RedirectStandardError b.log -PassThru -NoNewWindow | Out-Null
+          $pa = Start-Process $BIN -ArgumentList "tunnel","--home","C:\a","--overlay-ip","100.88.0.3","--relay","127.0.0.1:51820","--peers","C:\a\config\peers" -RedirectStandardError a.log -PassThru -NoNewWindow
+          Start-Sleep 7
+          Write-Host "--- node A ---"; Get-Content a.log -ErrorAction SilentlyContinue
+          Write-Host "--- echo-peer B ---"; Get-Content b.log -ErrorAction SilentlyContinue
+          Write-Host "--- ENCRYPTED ping A->B (100.88.0.4) over the relay ---"
+          ping -n 5 -w 3000 100.88.0.4
+          $ok = ($LASTEXITCODE -eq 0)
+          Stop-Process -Id $pa.Id -Force -ErrorAction SilentlyContinue
+          if ($ok) { Write-Host "PASS: Windows encrypted end-to-end works" }
+          else { Write-Host "FAIL: no encrypted round-trip"; Get-Content relay.log -ErrorAction SilentlyContinue; exit 1 }

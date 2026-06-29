@@ -48,6 +48,7 @@ fn run(args: &[String]) -> Result<(), NodeError> {
         Some("up") => up(&args[1..]),
         Some("tunnel") => tunnel_cmd(&args[1..]),
         Some("selftest") => selftest_cmd(&args[1..]),
+        Some("echo-peer") => echo_peer_cmd(&args[1..]),
         Some("service-install") => service_install(&args[1..]),
         Some("down") => down(),
         Some("status") => status(&args[1..]),
@@ -324,6 +325,69 @@ fn selftest_cmd(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Transport-level echo peer: bind a UDP socket, connect to the relay, complete
+/// Noise handshakes with configured peers, and echo ICMP echo-requests back as
+/// encrypted replies.  No TUN is opened — use this to E2E-test the encrypted
+/// overlay path (relay + node A + echo-peer as node B) on a single host.
+///
+/// Required: `--overlay-ip <ip>`, `--relay <host:port>`.
+/// Optional: `--peers <file>` (default `<home>/config/peers`),
+///           `--secs <n>` (default 30), `--home <path>`.
+fn echo_peer_cmd(args: &[String]) -> Result<(), NodeError> {
+    let dirs = NodeDirs::new(node_home(args)?);
+    dirs.create()?;
+    let id = identity::Identity::load_or_create(
+        &dirs.config.join("identity.key"),
+        &dirs.config.join("identity.pub"),
+    )?;
+
+    let overlay_ip: Ipv4Addr = arg_value(args, "--overlay-ip")
+        .ok_or_else(|| NodeError::Usage("echo-peer needs --overlay-ip <ip>".into()))?
+        .parse()
+        .map_err(|_| NodeError::Usage("invalid overlay ip".to_string()))?;
+    let relay_s = arg_value(args, "--relay")
+        .ok_or_else(|| NodeError::Usage("echo-peer needs --relay <host:port>".into()))?
+        .to_string();
+    let relay: SocketAddr = relay_s
+        .to_socket_addrs()
+        .map_err(|e| NodeError::Usage(format!("cannot resolve relay '{relay_s}': {e}")))?
+        .next()
+        .ok_or_else(|| NodeError::Usage(format!("relay '{relay_s}' resolved to no address")))?;
+    let secs: u64 = arg_value(args, "--secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let peers_path = arg_value(args, "--peers")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.config.join("peers"));
+    let peers = peers::PeerTable::load_file(&peers_path);
+
+    let overlay_cidr = format!(
+        "{}/{}",
+        akurai_common::OVERLAY_IPV4_NET,
+        akurai_common::OVERLAY_IPV4_PREFIX_LEN
+    );
+    // iface/mtu/advertise/exit_node/acl/control_url/cookie_jar/node_token are not
+    // used by echo_peer (no TUN, no control-plane refresh), but TunnelConfig is
+    // the canonical config carrier so we fill it fully.
+    let cfg = tunnel::TunnelConfig {
+        iface: "akurai0".to_string(),
+        overlay_ip,
+        overlay_cidr,
+        mtu: akurai_common::OVERLAY_MTU,
+        relay,
+        keypair: id.keypair,
+        peers,
+        advertise: Vec::new(),
+        exit_node: None,
+        acl: None,
+        control_url: None,
+        cookie_jar: None,
+        node_token: None,
+    };
+    tunnel::echo_peer(cfg, secs)?;
+    Ok(())
+}
+
 /// Render the systemd unit that runs the tunnel daemon at boot. The daemon reads
 /// `network.conf` for its parameters, so the unit needs no arguments beyond `--home`.
 fn render_tunnel_unit(bin: &Path, home: &Path) -> String {
@@ -455,6 +519,11 @@ fn print_usage() {
     println!("    tunnel [--home <p>]     Run the encrypted mesh daemon (reads network.conf)");
     println!("           [--acl <file>] [--my-tags tag:a,tag:b]");
     println!("                            Enforce a fail-closed tag ACL when the file exists");
+    println!("    selftest [--overlay-ip <ip>] [--secs <n>]");
+    println!("                            Echo ICMP on the TUN without a peer (root)");
+    println!("    echo-peer --overlay-ip <ip> --relay <host:port>");
+    println!("              [--peers <file>] [--secs <n>]");
+    println!("                            Encrypted overlay echo peer (no TUN, no root)");
     println!("    service-install         Install + start the systemd tunnel service (root)");
     println!("    down                    Disable host-only membership");
     println!("    status                  Show local node status");
@@ -685,5 +754,49 @@ mod tests {
             dirs.overlay_file,
             PathBuf::from("/tmp/akurai-vpn-test/state/overlay.ip")
         );
+    }
+
+    /// echo_peer_cmd must return a Usage error that mentions `overlay-ip` when
+    /// `--overlay-ip` is absent.  The identity is generated in a throw-away temp
+    /// dir (cleaned up after the test).
+    #[test]
+    fn echo_peer_cmd_requires_overlay_ip() {
+        let dir = format!("/tmp/akurai-ep-test-{}", std::process::id());
+        let args = vec![
+            "--home".to_string(),
+            dir.clone(),
+            "--relay".to_string(),
+            "127.0.0.1:51820".to_string(),
+        ];
+        match echo_peer_cmd(&args) {
+            Err(NodeError::Usage(msg)) => {
+                assert!(
+                    msg.contains("overlay-ip"),
+                    "expected overlay-ip in error, got: {msg}"
+                )
+            }
+            result => panic!("expected Usage(overlay-ip) error, got {result:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// echo_peer_cmd must return a Usage error that mentions `relay` when
+    /// `--relay` is absent.
+    #[test]
+    fn echo_peer_cmd_requires_relay() {
+        let dir = format!("/tmp/akurai-ep-relay-test-{}", std::process::id());
+        let args = vec![
+            "--home".to_string(),
+            dir.clone(),
+            "--overlay-ip".to_string(),
+            "100.88.0.9".to_string(),
+        ];
+        match echo_peer_cmd(&args) {
+            Err(NodeError::Usage(msg)) => {
+                assert!(msg.contains("relay"), "expected relay in error, got: {msg}")
+            }
+            result => panic!("expected Usage(relay) error, got {result:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
