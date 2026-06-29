@@ -4,6 +4,37 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
+
+Built on top of the v0.1.0 mesh, all pure-Rust zero-dep, each **verified in network namespaces** (host stack never touched) and committed:
+
+- **MVP3 — direct peer-to-peer mesh** (`FrameKind::PeerAddr`): handshakes go via the relay, which hints each end the other's observed UDP address; nodes probe (NAT hole-punch) and **upgrade off the relay to a direct path**, with relay fallback. Per-peer `PeerState{session,pending,direct,candidate}`. Proof: `tests/netns/direct.sh`.
+- **MVP2 — subnet gateway**: `--advertise <CIDR>` + peers-file 4th field; peers route the subnet over the overlay to the gateway, which `ip_forward`s to the real LAN. Proof: `tests/netns/subnet.sh`.
+- **MVP2 — exit gateway (full-tunnel)**: `--exit-node <peer>` opt-in routes `0.0.0.0/0` via **`/1` routes that never delete the real default** (tunnel close = auto-restore); `--advertise 0.0.0.0/0` enables MASQUERADE. A `0.0.0.0/0` advertisement is **never** auto-installed (hard safety guard). Proof: `tests/netns/exit.sh`.
+- **MagicDNS**: node serves `<overlay_ip>:53` resolving `<peer>.akurai` (`akurai-dns` lib). Proof: `e2e.sh` MagicDNS check.
+- **One-touch daemon**: `akurai-node service-install` (systemd, `CAP_NET_ADMIN`, boot-start) + `network.conf`-driven `tunnel`; installer auto-runs it with sudo. FIX: relay resolved as `host:port` via DNS.
+- **Multi-arch**: `akurai-node` cross-compiles to **aarch64** with just `rust-lld` (zero-dep payoff). Published `akurai-node-linux-aarch64.bin`.
+
+### Live (v0.2.0) — REDEPLOYED
+Control plane **v0.2.0** (vpn.olibuijr.com), relay **v0.2.0** (EC2 systemd, restarted — emits PeerAddr so direct-path works in prod), node binary **0.2.0** (x86_64 + aarch64) + installer published.
+
+### Regression — `sudo tests/netns/{e2e,subnet,direct,exit}.sh` → 7/7 PASS
+OVERLAY_PING · CIPHERTEXT · MAGICDNS · FAILCLOSED · SUBNET_GATEWAY · DIRECT_PATH · EXIT_GATEWAY.
+
+### Gotchas (carry forward)
+1. **netns resolv.conf trap** (FIXED): never write `/etc/resolv.conf` inside `ip netns exec` unless `/etc/netns/<ns>/resolv.conf` exists first — it clobbers the HOST's resolv.conf.
+2. **EC2 relay port**: host `ufw` INPUT-policy-DROP — the AWS SG rule alone is NOT enough; also `sudo ufw allow 51820/udp`.
+3. **Host safety**: all multi-node verification in netns; never bring a tunnel up in the host namespace.
+
+### Remaining toward 100% "complete" (honest roadmap)
+- **MVP4 — public ingress** (Funnel/Serve equivalent). NOT built.
+- **Fine-grained ACL enforcement in the data path** (`akurai-common::policy` exists, unwired beyond network-level fail-closed).
+- **IPv6 overlay data path** (`fd88::/48` defined; pump is IPv4-only).
+- **Control-plane endpoint distribution** for robust symmetric-NAT direct paths (relay PeerAddr handles cone NAT today).
+- **Production hardening**: session rekey/expiry, durable node auth token, native mobile/desktop apps.
+
+---
+
 ## Update — 2026-06-29 (v0.1.0): WORKING ENCRYPTED MESH DATA PLANE (MVP1) — live
 
 The VPN now actually tunnels traffic. A node brings up `akurai0`, and one enrolled device can `ping` another over the `100.88.0.0/16` overlay, carried as end-to-end ChaCha20-Poly1305 ciphertext, hub-routed through the relay (which holds no keys). **Proven end-to-end** in Linux netns locally AND against the live deployed relay on EC2.
