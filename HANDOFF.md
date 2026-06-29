@@ -20,10 +20,15 @@ Nodes authenticated `/api/peermap` + `/api/heartbeat` with the **OIDC session co
 - The node **self-bootstraps** `config/node.token` from the cookie on first run, then uses Bearer for peer-fetch + refresh + heartbeat. **Proven cookie-independent**: with `cookies.txt` deleted, midget came up, fetched peers, refreshed, heartbeated, and stayed `online:true` purely on the token.
 - Control plane is **v0.3.1 live** at vpn.olibuijr.com (deployed via `./deploy.sh`; gates fmt+clippy+test).
 
+### Also done in this wave (v0.3.2)
+- **Persistent + expiring session store** (`crates/akurai-control/src/auth.rs`): sessions+CSRF+24h `expires_at` now persist to `$AKURAI_DATA_DIR/sessions.json` (atomic temp+rename), pruned on load, rejected on expiry. **Cookie/dashboard logins now survive a control-plane restart** — verified live (a session written to disk authenticated after `systemctl restart`). Removed the separate in-memory `csrf_tokens` map. So the v0.3.x "every deploy logs everyone out" flaw is fixed for browser sessions too (nodes were already immune via tokens).
+- **Android durable token client** (committed): provisioning captures `node_token`; heartbeat + peer-refresh prefer `Authorization: Bearer` (cookie fallback kept). Built clean; **device-install still pending (phone unplugged)**.
+
 ### Remaining
-- **Phone**: install the reconnect APK (blocked — device was unplugged from USB mid-session); then add **token auth to the Android client** so the phone is durable too (today it's still cookie-based, so it goes offline on a control-plane restart — that is why CPH2645 shows offline after the v0.3.x deploys).
-- **Operational**: a control-plane deploy still logs out all *cookie* sessions (in-memory store); durable tokens make nodes immune, but a persistent session store (or short-lived access + refresh) would also keep browser/dashboard sessions alive across deploys.
-- Token **revoke/rotate** UI in the dashboard.
+- **Phone**: install the current APK (self-heal + durable-token client + UI cleanup) — blocked only on the device being plugged into USB; then live-verify `updatePeers`, the green peers, and token survival.
+- Token **revoke/rotate** UI in the dashboard (issue/durable/persist done; revoke is the missing CRUD verb).
+- **Multi-OS native clients** (macOS/Windows) — the Linux node already runs anywhere Linux does; other-OS clients are net-new and can't be built/tested on this host.
+- **Symmetric-NAT** control-plane endpoint distribution (cone NAT works today via relay PeerAddr).
 
 ## Update — 2026-06-29 (v0.2.0): MVP1–3 + MagicDNS + gateways + multi-arch — a working Tailscale alternative
 
