@@ -63,3 +63,54 @@ jobs:
             target/release/akurai-node
             target/release/akurai-node.exe
           if-no-files-found: warn
+
+  # Runtime smoke test: actually RUN the client on real macOS/Windows and confirm
+  # it brings the platform data-plane device UP ("tunnel up" only prints after the
+  # utun/Wintun create + interface setup succeed). This runtime-verifies the FFI
+  # device-create path — the part most likely to compile yet fail at runtime.
+  runtime-smoke:
+    name: runtime smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build node (release)
+        run: cargo build --release -p akurai-node
+      - name: macOS — bring up utun and assert tunnel up
+        if: runner.os == 'macOS'
+        run: |
+          BIN=./target/release/akurai-node
+          "$BIN" install --home /tmp/akv
+          echo "100.88.0.2 $(cat /tmp/akv/config/identity.pub) peer" > /tmp/akv/config/peers
+          sudo "$BIN" tunnel --home /tmp/akv --overlay-ip 100.88.0.3 \
+            --relay 127.0.0.1:51820 --peers /tmp/akv/config/peers > smoke.log 2>&1 &
+          PID=$!
+          sleep 6
+          sudo kill "$PID" 2>/dev/null || true
+          echo "--- node output ---"; cat smoke.log
+          echo "--- utun interfaces ---"; ifconfig | grep -i utun || true
+          grep -q "tunnel up" smoke.log && echo "PASS: macOS utun data plane came up" \
+            || { echo "FAIL: utun did not come up"; exit 1; }
+      - name: Windows — bring up Wintun and assert tunnel up
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun-extract -Force
+          Copy-Item wintun-extract/wintun/bin/amd64/wintun.dll target/release/wintun.dll
+          $home2 = Join-Path $env:TEMP akv
+          ./target/release/akurai-node.exe install --home $home2
+          $pub = Get-Content (Join-Path $home2 config/identity.pub)
+          "100.88.0.2 $pub peer" | Out-File -Encoding ascii (Join-Path $home2 config/peers)
+          $p = Start-Process -FilePath ./target/release/akurai-node.exe `
+            -ArgumentList "tunnel","--home",$home2,"--overlay-ip","100.88.0.3","--relay","127.0.0.1:51820","--peers",(Join-Path $home2 config/peers) `
+            -RedirectStandardError smoke.log -RedirectStandardOutput smoke.out -PassThru -NoNewWindow
+          Start-Sleep -Seconds 6
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "--- node output ---"; Get-Content smoke.log -ErrorAction SilentlyContinue
+          if (Select-String -Path smoke.log -Pattern "tunnel up" -Quiet) { Write-Host "PASS: Windows Wintun data plane came up" }
+          else { Write-Host "FAIL: Wintun did not come up"; exit 1 }
