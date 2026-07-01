@@ -1,7 +1,7 @@
 # AkurAI VPN — Protocol (relay frame, handshake, data session)
 
-This describes the on-the-wire protocol of the MVP1 data plane, taken directly from
-the code. Three layers stack inside one UDP datagram:
+This describes the current on-the-wire data-plane protocol, taken directly from the
+code. Three layers stack inside one UDP datagram:
 
 1. the **relay frame** — the outer envelope the relay reads and forwards
    (`akurai-common/src/frame.rs`);

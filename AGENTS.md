@@ -13,4 +13,4 @@ search_notes("AkurAI-VPN")
 get_note(30)
 ```
 
-Covers: README · crate map · constitutional principles · MVP ladder · CHANGELOG · ISA · architecture · networking · gateway modes · threat model · protocol (UNRESOLVED crypto decision) · deployment · netns test plan.
+Covers: README · crate map · constitutional principles · MVP ladder · CHANGELOG · ISA · architecture · networking · gateway modes · threat model · resolved zero-dependency protocol decision · deployment · netns test plan.

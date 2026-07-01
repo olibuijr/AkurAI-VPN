@@ -4,6 +4,33 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Current State — 2026-07-01 (v0.3.5 live)
+
+- **Control plane:** `https://vpn.olibuijr.com` is live as v0.3.5 with OIDC login,
+  per-user node networks, overlay IP allocation, durable rotatable node tokens,
+  persistent browser sessions, `/api/peermap`, and `/api/heartbeat`.
+- **Relay:** EC2 UDP/51820 forwards ciphertext only. It remains the fallback path for
+  symmetric NAT or any peer pair that has not proven a direct UDP route.
+- **Public site / installer:** `https://akurai-vpn.olibuijr.com` serves the installer
+  and node binaries. Linux x86_64 downloads are v0.3.5.
+- **Default install safety:** the installer registers the node, writes
+  `~/.akurai-vpn/config/network.conf`, and starts `akurai-node-tunnel.service` when
+  sudo is available. The tunnel adds the overlay route only; subnet/exit gateways are
+  implemented but opt-in and never advertised by the default installer.
+- **Path selection:** same-LAN/local UDP candidates from heartbeat are tried before
+  the relay; relay `PeerAddr` hints still support cone-NAT direct paths; symmetric NAT
+  falls back to the relay. Direct paths are promoted only after a valid frame from a
+  configured peer/static key.
+- **Runtime feature status:** subnet gateway, exit gateway, MagicDNS, ACL enforcement,
+  public TCP ingress, IPv6 overlay, durable node auth, and self-healing peer refresh are
+  implemented and covered by netns/CI tests. The remaining gaps are admin CLI/UI
+  approval workflows, signed desktop installers, advanced ICE/path scoring, and
+  TLS/identity policy around ingress.
+
+Older dated sections below are preserved as release history. Treat this block and the
+canonical AkurAI Notes entry as authoritative when an older section says a feature is
+not yet built.
+
 ## Update — 2026-07-01: LAN-local direct path candidates
 
 Same-LAN peers no longer have to rely on the central relay's observed public/NAT
@@ -164,10 +191,11 @@ The "next milestone" decision below was made and implemented: **per-node overlay
 
 ## Current Product Direction
 
-The VPN is intentionally host-only by default.
+The VPN is intentionally host-only/overlay-only by default.
 
 - Only devices with the AkurAI-VPN node installed should be reachable.
 - No subnet routing, exit routing, or gateway advertisement should happen in the default install.
+- Subnet and exit gateways exist, but require explicit opt-in configuration.
 - Each AkurAI user has their own private network.
 - Install path defaults to `~/.akurai-vpn`.
 - The node must not disturb the machine's existing internet connectivity, especially `wlan0`.
@@ -177,7 +205,7 @@ The VPN is intentionally host-only by default.
 ### Control plane
 
 - Public health: `https://vpn.olibuijr.com/api/health`
-- Current live version: `0.0.8`
+- Current live version: `0.3.5`
 - Validation script passes against the live deployment.
 
 ### Public site
@@ -197,6 +225,7 @@ The VPN is intentionally host-only by default.
   - `state=up`
   - `mode=host-only`
   - `routing=disabled`
+  - tunnel service: `akurai-node-tunnel.service`
 
 The control plane currently shows the node record as:
 
@@ -204,10 +233,12 @@ The control plane currently shows the node record as:
 - id: `5d838b5344d14603`
 - public key: `VGwyx1S7OcPIW6pnH+GPIUFCn92qW3cKbHKuYhiXtlg=`
 - added by: `olibuijr@olibuijr.com`
-- endpoint: empty
-- allowed IPs: empty
+- endpoint: heartbeat-populated while the tunnel is running
+- allowed IPs: contains the node overlay address
 
-That means the node is registered, but no overlay endpoint address has been assigned or configured yet in the control plane record.
+That means the node is registered, has a stable overlay IP, and advertises a fresh
+direct endpoint while the tunnel service is running. Loopback underlay sources are not
+published as direct candidates.
 
 ## Safety Constraint
 
@@ -215,7 +246,7 @@ Do not break the machine's existing network access while working on this.
 
 - `wlan0` connectivity was verified during install/deploy work.
 - The default route remained on `wlan0`.
-- The node implementation is host-only and does not create routes or TUN-based gateway behavior.
+- The default node install creates only the overlay route. Gateway behavior is opt-in.
 
 Before any future networking change:
 
@@ -334,7 +365,7 @@ The installer should:
 2. Install it under `~/.akurai-vpn/bin/akurai-node`.
 3. Prompt for AkurAI IDP credentials.
 4. Register the node in the user's own VPN network.
-5. Start host-only membership.
+5. Start host-only membership and, when sudo is available, the encrypted tunnel service.
 
 Post-install checks:
 
@@ -349,16 +380,14 @@ Expected status characteristics:
 - `mode: host-only`
 - `routing: disabled`
 - `state: up` after install
+- `akurai-node-tunnel.service` running when sudo was available during install
 
 ## What Another Agent Should Do Next
 
-1. Keep the host-only default intact.
+1. Keep the host-only/overlay-only default intact.
 2. Preserve `wlan0` internet connectivity while making any further networking changes.
-3. Decide whether the next milestone is:
-   - actual per-node overlay IP allocation,
-   - direct peer-to-peer connectivity,
-   - or route advertisement beyond host-only mode.
-4. If adding IP assignment, ensure the control-plane record stores and surfaces it clearly.
+3. Treat route advertisement, exit routing, ACL files, and ingress as explicit opt-in features.
+4. Improve the admin CLI/UI approval workflow before exposing route/ingress management broadly.
 5. If touching deploy flow for `akurai-vpn-site`, verify the static artifact path and the release-engine working directory before changing code.
 6. Re-run `./scripts/validate.sh` after any change to the control plane.
 

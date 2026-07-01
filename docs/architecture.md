@@ -5,8 +5,8 @@ peer paths with relay fallback: peers prefer a confirmed direct UDP address
 (including same-LAN private addresses advertised through heartbeat), and use the
 central relay only until a direct path is proven or when direct UDP cannot work. The
 relay never holds payload keys — it moves end-to-end ciphertext. This document
-describes what is actually built and deployed; aspirational features are explicitly
-marked **NOT YET BUILT**.
+describes what is actually built and deployed; remaining management and packaging
+gaps are explicitly marked as future work.
 
 The whole shipped data plane is **pure Rust, `std`-only, zero runtime dependencies**.
 The single `unsafe` in the codebase is one `ioctl` to create the TUN device
@@ -15,7 +15,7 @@ safe `std`. Data-plane cryptography is hand-rolled in `akurai-crypto` against RF
 vectors (decision resolved 2026-06-27: keep the zero-dependency identity rather than
 link rustls/quinn/snow/ed25519; the hand-rolled-crypto risk is accepted deliberately).
 
-Workspace version: `0.3.3` plus current unreleased LAN-local direct-path work. The
+Workspace version: `0.3.5`, deployed live on 2026-07-01. The
 first working encrypted overlay mesh landed in the `0.1.0` changelog entry
 (2026-06-29).
 
@@ -27,11 +27,12 @@ first working encrypted overlay mesh landed in the `0.1.0` changelog entry
 | `akurai-crypto` | Zero-dep crypto primitives | `x25519` (RFC 7748), `chacha20poly1305` (RFC 8439), `blake2s` (RFC 7693), `hkdf`; each verified against official RFC vectors in-crate |
 | `akurai-transport` | Secure channel | `noise` (WireGuard-style `Noise_IK` handshake), `session` (counter-nonce data packets + 64-entry replay window), `Keypair`/`TransportKeys` |
 | `akurai-sys` | The OS seam | `raw` (the only `unsafe` — one `ioctl(TUNSETIFF)` via a direct `syscall`), `tun` (`create` → `/dev/net/tun` handle, `IFF_TUN | IFF_NO_PI`) |
-| `akurai-node` | Node daemon | `identity` (persistent X25519 static keypair), `peers` (overlay-IP-indexed peer table + direct endpoint candidates), `tunnel` (the TUN↔UDP pump with direct path + relay fallback), `main` (CLI: `install`/`up`/`down`/`tunnel`/`status`/`path`/`version`) |
+| `akurai-node` | Node daemon | `identity` (persistent X25519 static keypair), `peers` (overlay-IP-indexed peer table + direct endpoint candidates), `acl` (optional tag policy), `tunnel` (the TUN↔UDP pump with direct path + relay fallback), `main` (CLI: `install`/`up`/`down`/`tunnel`/`service-install`/`status`/`path`/`version`) |
 | `akurai-relay` | Ciphertext-only fallback hub | `forward` (learn src endpoint, forward by dest overlay IP, send `PeerAddr` hints during handshakes, drop unknown; holds no keys, links no crypto crate) |
 | `akurai-control` | Control plane (HTTP) | `ipam` (overlay IP allocation), `peermap` (`/api/peermap` with fresh endpoint candidates), `heartbeat` (`/api/heartbeat`, liveness TTL + node UDP endpoint), `listener` (auth + CSRF + endpoint CRUD) |
-| `akurai-admin` | Admin CLI | users/devices/ACLs/routes (early; data-plane policy NOT YET wired) |
-| `akurai-dns` | Internal/MagicDNS | placeholder — **NOT YET BUILT** (folded into control plane later) |
+| `akurai-admin` | Admin CLI | preauth/routes/ingress/devices/ACL command surface; currently a skeleton, not the live management path |
+| `akurai-dns` | Internal/MagicDNS | zero-dep DNS codec/server for `*.akurai`; also used by the node tunnel path |
+| `akurai-ingress` | Public ingress | pure-std TCP proxy from a public port to an internal overlay service |
 
 ## Layering
 
@@ -49,6 +50,9 @@ akurai-transport  (Noise_IK handshake + authenticated data-packet Session)
 
 akurai-control  (separate process: IPAM + peer map + heartbeat over HTTP; uses
                  akurai-common overlay arithmetic, never touches the data plane)
+
+akurai-dns / akurai-ingress (optional service binaries used for MagicDNS and public
+                             TCP ingress around the same overlay)
 ```
 
 - `akurai-common` is shared, crypto-free value code: it codes the relay `Frame`, owns
@@ -95,8 +99,9 @@ akurai-control  (separate process: IPAM + peer map + heartbeat over HTTP; uses
 - **Public site / installer:** `akurai-vpn.olibuijr.com` serves the landing page and
   `install.sh`; the node binary is published at
   `/downloads/akurai-node-linux-x86_64.bin`.
-- **Node:** installs to `~/.akurai-vpn` by default; host-only membership, no routes
-  beyond the overlay, never a default route.
+- **Node:** installs to `~/.akurai-vpn` by default; the installer starts a systemd
+  tunnel service when sudo is available. Default routing stays host-only/overlay-only:
+  subnet and exit gateways exist, but only when explicitly configured.
 
 ## MVP1 → MVP4 ladder
 
@@ -104,21 +109,22 @@ akurai-control  (separate process: IPAM + peer map + heartbeat over HTTP; uses
 |------|-------|--------|
 | **MVP0** | Planning, threat model, protocol decision (Noise-over-UDP, hand-rolled), DNS/deploy plan | **DONE** |
 | **MVP1** | Single-hub internal VPN: enrollment + static/served peer map, TUN creation, end-to-end-encrypted node↔node tunnel via the relay, overlay IP allocation, netns e2e proof | **DONE** |
-| **MVP2** | Gateway routes: subnet advertisement, admin route approval, route push to clients, exit-gateway opt-in, basic DNS names | NOT YET BUILT |
-| **MVP3** | Direct peer mesh: endpoint discovery, direct UDP attempts, NAT traversal, relay fallback, path-health scoring, roaming | **PARTIAL/DONE** for LAN/cone-NAT direct paths + symmetric-NAT relay fallback; advanced scoring remains future work |
-| **MVP4** | Public ingress: HTTPS ingress on the control host to internal services, TLS automation, identity-aware access | NOT YET BUILT |
+| **MVP2** | Gateway routes: subnet advertisement, route push to clients, exit-gateway opt-in, MagicDNS names | **DONE** for opt-in runtime primitives; admin approval UX remains future work |
+| **MVP3** | Direct peer mesh: endpoint discovery, direct UDP attempts, NAT traversal, relay fallback, path-health scoring, roaming | **DONE** for same-LAN/cone-NAT direct paths + symmetric-NAT relay fallback; advanced scoring/ICE remains future work |
+| **MVP4** | Public ingress: public TCP proxy to internal overlay services, TLS automation, identity-aware access | **DONE** for pure-Rust TCP ingress; TLS automation and identity-aware ingress policy remain future work |
 
-### Explicitly not yet built
+### Future work
 
 - **Advanced path scoring / ICE-style NAT traversal** — current direct paths use
   heartbeat endpoint candidates plus relay `PeerAddr` hints, with symmetric-NAT
   relay fallback; richer scoring and candidate sets are future work.
-- **Subnet / exit / gateway routes** — MVP2. The node installs an overlay-only route
-  and *never* a default route.
-- **MagicDNS / internal DNS** (`akurai-dns`) — placeholder crate.
-- **ACL enforcement in the data path** — the node authenticates peers by static key and
-  fail-closes on unknown destinations, but there is no tag/policy ACL check on the
-  packet path yet. The richer policy model (tags, `can_advertise`, allow rules) lives
-  only in planning/admin scaffolding.
+- **Management UX for approvals** — `akurai-admin` has the command surfaces for
+  pre-auth keys, route approval, ingress, devices, and ACLs, but those subcommands are
+  still skeletons. Runtime gateway/ACL/ingress primitives are tested separately.
+- **Packaged desktop clients** — Linux and Android are published; macOS utun and
+  Windows Wintun paths are runtime-verified in CI, but signed installers are still
+  future work.
+- **TLS automation / identity-aware public ingress** — `akurai-ingress` is a TCP proxy;
+  HTTPS certificate automation and browser-facing access policy are not built yet.
 - **WireGuard hardening on the handshake** — no pre-shared key, no MAC1/MAC2/cookie, no
   timestamp anti-replay on handshake initiation (a later phase). See `protocol.md`.

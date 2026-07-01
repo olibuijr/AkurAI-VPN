@@ -54,8 +54,9 @@ ip route add 100.88.0.0/16 dev akurai0      # overlay-scoped route ONLY
 
 It adds **no default route** — `0.0.0.0/0` is never installed. The host's existing
 internet path (e.g. `wlan0`) is inviolable. This is the host-only product default:
-only enrolled overlay peers are reachable; there is no subnet routing, exit routing, or
-gateway advertisement (those are MVP2, **NOT YET BUILT**).
+only enrolled overlay peers are reachable. Subnet gateways (`--advertise`) and exit
+gateways (`--exit-node`) are implemented, but they are strictly opt-in and never
+enabled by the default installer.
 
 ## Packet flow
 
@@ -175,12 +176,13 @@ sudo tests/netns/symmetric.sh
 A clean run prints `OVERLAY_PING: PASS`, `CIPHERTEXT_CHECK: PASS`, and
 `FAILCLOSED_CHECK: PASS`, and exits 0.
 
-## Not yet built
+## Future work
 
 - **Advanced path scoring / ICE-style NAT traversal** — LAN/cone-NAT direct paths and
   symmetric-NAT relay fallback exist; richer candidate scoring remains future work.
-- **Subnet / exit / gateway routes** (MVP2) — the node installs the overlay-only route
-  and never a default route.
-- **MagicDNS / internal DNS names** (`akurai-dns`) — placeholder.
-- **ACL enforcement in the data path** — peers are authenticated by static key and
-  unknown destinations are dropped, but there is no tag/policy ACL on the packet path.
+- **Admin-managed route approvals** — the runtime can advertise subnets and opt into
+  exit nodes, but the admin CLI/UI approval workflow is still skeleton-level.
+- **Packaged desktop clients** — macOS utun and Windows Wintun are runtime-verified in
+  CI; signed installers remain future work.
+- **Ingress hardening** — the TCP ingress proxy exists; TLS automation and
+  identity-aware browser access policy are still future work.
