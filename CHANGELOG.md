@@ -4,6 +4,11 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-01
+
+- Skip loopback direct endpoint candidates
+
+
 ## [0.3.4] - 2026-07-01
 
 - LAN-local direct path candidates

@@ -181,10 +181,10 @@ fn advertised_endpoint(relay: SocketAddr, tunnel_port: u16) -> Option<String> {
     sock.connect(relay).ok()?;
     let local = sock.local_addr().ok()?;
     match local {
-        SocketAddr::V4(v4) if !v4.ip().is_unspecified() => {
+        SocketAddr::V4(v4) if !v4.ip().is_unspecified() && !v4.ip().is_loopback() => {
             Some(SocketAddr::from((*v4.ip(), tunnel_port)).to_string())
         }
-        SocketAddr::V6(v6) if !v6.ip().is_unspecified() => {
+        SocketAddr::V6(v6) if !v6.ip().is_unspecified() && !v6.ip().is_loopback() => {
             Some(SocketAddr::from((*v6.ip(), tunnel_port)).to_string())
         }
         _ => None,
@@ -265,5 +265,11 @@ mod tests {
             heartbeat_body("node\"a", "192.168.1.44:51399"),
             r#"{"id":"node\"a","endpoint":"192.168.1.44:51399"}"#
         );
+    }
+
+    #[test]
+    fn advertised_endpoint_skips_loopback_source() {
+        let relay = "127.0.0.1:51820".parse().unwrap();
+        assert_eq!(advertised_endpoint(relay, 50000), None);
     }
 }
