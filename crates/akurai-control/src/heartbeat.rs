@@ -14,10 +14,7 @@ pub const HEARTBEAT_TTL_SECS: u64 = 120;
 pub struct Heartbeat {
     /// Last reported UDP socket address (may be empty if the node reported none).
     ///
-    /// Recorded now so relay assignment can consume it later; the peer-map
-    /// snapshot does not yet surface it, hence `allow(dead_code)` (matching the
-    /// crate's convention for not-yet-wired forward-facing fields).
-    #[allow(dead_code)]
+    /// Surfaced through the peer map as a direct-path candidate while fresh.
     pub endpoint: String,
     /// UNIX timestamp (seconds) of the most recent heartbeat.
     pub last_seen: u64,

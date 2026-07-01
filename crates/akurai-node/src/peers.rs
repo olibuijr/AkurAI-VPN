@@ -12,7 +12,7 @@
 //! destination not in the table is dropped by the data plane.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 
@@ -25,6 +25,10 @@ pub struct Peer {
     pub overlay_ip: Ipv4Addr,
     pub public_key: [u8; 32],
     pub name: String,
+    /// Direct UDP candidate from the control plane or static peer file. This is
+    /// only a candidate: the data plane confirms it by receiving an authenticated
+    /// frame from this peer before sending data on it.
+    pub endpoint: Option<SocketAddr>,
     /// Subnets this peer is an approved gateway for (MVP2 subnet routing). A
     /// packet whose destination falls in one of these is tunnelled to this peer,
     /// which forwards it to the real subnet behind it.
@@ -111,6 +115,14 @@ impl PeerTable {
             .collect()
     }
 
+    /// Every peer endpoint advertised as a direct UDP candidate.
+    pub fn direct_endpoints(&self) -> Vec<(Ipv4Addr, SocketAddr)> {
+        self.by_ip
+            .values()
+            .filter_map(|p| p.endpoint.map(|e| (p.overlay_ip, e)))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.by_ip.len()
     }
@@ -168,13 +180,13 @@ impl PeerTable {
 }
 
 /// Parse a static peers file: one
-/// `<overlay_ip> <pubkey_b64> [name] [advertised] [tags]` per line, e.g.
-/// `100.88.0.3 <pubkey> nodeb 192.168.50.0/24 tag:server,tag:trusted`.
+/// `<overlay_ip> <pubkey_b64> [name] [advertised] [tags] [endpoint]` per line, e.g.
+/// `100.88.0.3 <pubkey> nodeb 192.168.50.0/24 tag:server,tag:trusted 192.168.1.9:51820`.
 /// The 4th field is comma-separated advertised CIDRs (`-` or any non-CIDR
 /// token ⇒ none, which lets a tagged peer with no subnets keep the 5th field
 /// positional). The 5th field is comma-separated ACL tags (`tag:` prefix
-/// optional). Blank lines and `#` comments are ignored; unparseable lines are
-/// skipped.
+/// optional; use `-` when the 6th endpoint field is present with no tags).
+/// Blank lines and `#` comments are ignored; unparseable lines are skipped.
 pub fn parse_peers_file(content: &str) -> Vec<Peer> {
     let mut peers = Vec::new();
     for line in content.lines() {
@@ -190,15 +202,23 @@ pub fn parse_peers_file(content: &str) -> Vec<Peer> {
         // Optional 4th field: comma-separated advertised subnets (gateway peer).
         let advertised = parts
             .next()
+            .filter(|s| *s != "-")
             .map(|s| s.split(',').filter_map(parse_cidr).collect())
             .unwrap_or_default();
         // Optional 5th field: comma-separated ACL tags.
-        let tags = parts.next().map(parse_tags).unwrap_or_default();
+        let tags = parts
+            .next()
+            .filter(|s| *s != "-")
+            .map(parse_tags)
+            .unwrap_or_default();
+        // Optional 6th field: direct UDP endpoint candidate.
+        let endpoint = parts.next().and_then(|s| s.parse::<SocketAddr>().ok());
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
+                endpoint,
                 advertised,
                 tags,
             });
@@ -229,7 +249,7 @@ pub fn parse_cidr(s: &str) -> Option<Cidr> {
 }
 
 /// Parse the control plane's peer-map JSON array
-/// (`[{"overlay_ipv4":"..","public_key":"..","name":"..","online":..}]`).
+/// (`[{"overlay_ipv4":"..","public_key":"..","name":"..","online":..,"endpoint":".."}]`).
 /// Hand-rolled, dependency-free; skips malformed objects.
 pub fn parse_peermap_json(json: &str) -> Vec<Peer> {
     let mut peers = Vec::new();
@@ -252,11 +272,15 @@ pub fn parse_peermap_json(json: &str) -> Vec<Peer> {
         let tags = json_str_field(obj, "tags")
             .map(|s| parse_tags(&s))
             .unwrap_or_default();
+        let endpoint = json_str_field(obj, "endpoint")
+            .and_then(|s| (!s.trim().is_empty()).then_some(s))
+            .and_then(|s| s.parse::<SocketAddr>().ok());
         if let (Ok(ip), Some(pk)) = (ip_s.parse::<Ipv4Addr>(), b64::decode_array::<32>(&pk_s)) {
             peers.push(Peer {
                 overlay_ip: ip,
                 public_key: pk,
                 name,
+                endpoint,
                 advertised,
                 tags,
             });
@@ -315,6 +339,20 @@ mod tests {
         assert_eq!(peers[0].overlay_ip, Ipv4Addr::new(100, 88, 0, 5));
         assert_eq!(peers[0].public_key, pk(9));
         assert_eq!(peers[0].name, "phone");
+        assert_eq!(peers[0].endpoint, None);
+    }
+
+    #[test]
+    fn parses_control_peermap_endpoint() {
+        let pk_b64 = b64::encode(&pk(9));
+        let json = format!(
+            "[{{\"overlay_ipv4\":\"100.88.0.5\",\"public_key\":\"{pk_b64}\",\"name\":\"phone\",\"online\":true,\"endpoint\":\"192.168.1.44:51820\"}}]"
+        );
+        let peers = parse_peermap_json(&json);
+        assert_eq!(
+            peers[0].endpoint,
+            Some("192.168.1.44:51820".parse().unwrap())
+        );
     }
 
     #[test]
@@ -323,6 +361,7 @@ mod tests {
             overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
             public_key: pk(1),
             name: "b".into(),
+            endpoint: None,
             advertised: vec![],
             tags: vec![],
         }]);
@@ -346,6 +385,7 @@ mod tests {
             overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
             public_key: pk(1),
             name: "gw".into(),
+            endpoint: None,
             advertised: vec![parse_cidr("192.168.50.0/24").unwrap()],
             tags: vec![],
         }]);
@@ -386,11 +426,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_static_peer_endpoint_with_placeholders() {
+        let pk_b64 = b64::encode(&pk(5));
+        let peers = parse_peers_file(&format!("100.88.0.3 {pk_b64} laptop - - 10.0.0.3:51820\n"));
+        assert_eq!(peers[0].endpoint, Some("10.0.0.3:51820".parse().unwrap()));
+    }
+
+    #[test]
     fn peer_principals_are_tag_principals() {
         let p = Peer {
             overlay_ip: Ipv4Addr::new(100, 88, 0, 3),
             public_key: pk(1),
             name: "x".into(),
+            endpoint: None,
             advertised: vec![],
             tags: vec![Tag("server".into()), Tag("trusted".into())],
         };

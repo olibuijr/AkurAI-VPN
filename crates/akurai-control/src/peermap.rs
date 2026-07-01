@@ -2,9 +2,10 @@
 //!
 //! Builds the per-node view of the network — for a given user, the set of their
 //! own [`VpnEndpoint`]s a node may reach, minus the requesting node itself, each
-//! tagged with its overlay IPv4 and current liveness. The data-plane node polls
-//! this to learn its peers. The ACL-filtered watch stream is not implemented in
-//! 0.0.1; this is the snapshot endpoint that backs it.
+//! tagged with its overlay IPv4, current liveness, and best direct UDP endpoint
+//! candidate. The data-plane node polls this to learn its peers. The ACL-filtered
+//! watch stream is not implemented in 0.0.1; this is the snapshot endpoint that
+//! backs it.
 
 use std::collections::HashMap;
 
@@ -19,9 +20,11 @@ use crate::vpn_endpoint::VpnEndpoint;
 /// * the caller's own node, named by `self_id`, is excluded — when `self_id` is
 ///   `None`, nothing is excluded on that basis.
 ///
-/// Each element is `{"overlay_ipv4","public_key","name","online"}`. `online` is
-/// `true` when a fresh heartbeat exists for that node id (see
-/// [`heartbeat::is_online`]). Hand-rolled JSON — no serde.
+/// Each element is `{"overlay_ipv4","public_key","name","online","endpoint"}`.
+/// `online` is `true` when a fresh heartbeat exists for that node id (see
+/// [`heartbeat::is_online`]). `endpoint` is the fresh heartbeat endpoint when
+/// present, otherwise the endpoint saved on the enrolled device record. Hand-rolled
+/// JSON — no serde.
 pub fn build_peermap_json(
     endpoints: &[VpnEndpoint],
     heartbeats: &HashMap<String, Heartbeat>,
@@ -42,16 +45,27 @@ pub fn build_peermap_json(
 /// Serialize one peer to a JSON object string.
 fn peer_json(e: &VpnEndpoint, heartbeats: &HashMap<String, Heartbeat>, now: u64) -> String {
     let overlay = ipam::overlay_addr_string(&e.allowed_ips).unwrap_or_default();
-    let online = heartbeats
-        .get(&e.id)
+    let hb = heartbeats.get(&e.id);
+    let online = hb
         .map(|hb| heartbeat::is_online(hb.last_seen, now))
         .unwrap_or(false);
+    let endpoint = if online {
+        hb.map(|h| h.endpoint.trim()).filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+    .or_else(|| {
+        let saved = e.endpoint_addr.trim();
+        (!saved.is_empty()).then_some(saved)
+    })
+    .unwrap_or("");
     format!(
-        "{{\"overlay_ipv4\":\"{}\",\"public_key\":\"{}\",\"name\":\"{}\",\"online\":{}}}",
+        "{{\"overlay_ipv4\":\"{}\",\"public_key\":\"{}\",\"name\":\"{}\",\"online\":{},\"endpoint\":\"{}\"}}",
         json_esc(&overlay),
         json_esc(&e.public_key),
         json_esc(&e.name),
         online,
+        json_esc(endpoint),
     )
 }
 
@@ -144,6 +158,43 @@ mod tests {
         hbs.insert("a".to_string(), fresh(now));
         let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, now);
         assert!(json.contains("\"online\":true"));
+    }
+
+    #[test]
+    fn fresh_heartbeat_endpoint_is_included() {
+        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let now = 1_000;
+        let mut hbs = HashMap::new();
+        hbs.insert(
+            "a".to_string(),
+            Heartbeat {
+                endpoint: "192.168.1.44:51399".to_string(),
+                last_seen: now,
+            },
+        );
+        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, now);
+        assert!(json.contains("\"endpoint\":\"192.168.1.44:51399\""));
+    }
+
+    #[test]
+    fn stale_heartbeat_endpoint_is_not_included() {
+        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let mut hbs = HashMap::new();
+        hbs.insert(
+            "a".to_string(),
+            Heartbeat {
+                endpoint: "192.168.1.44:51399".to_string(),
+                last_seen: 1_000,
+            },
+        );
+        let json = build_peermap_json(
+            &endpoints,
+            &hbs,
+            "user@example.com",
+            None,
+            1_001 + heartbeat::HEARTBEAT_TTL_SECS,
+        );
+        assert!(json.contains("\"endpoint\":\"\""));
     }
 
     #[test]

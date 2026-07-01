@@ -100,12 +100,13 @@ fn install(args: &[String]) -> Result<(), NodeError> {
         &dirs.config.join("identity.key"),
         &dirs.config.join("identity.pub"),
     )?;
+    let pubkey_b64 = id.public_b64();
 
     println!("installed {NAME} {VERSION}");
     println!("  home : {}", dirs.home.display());
     println!("  bin  : {}", installed_exe.display());
     println!("  mode : host-only (routing disabled)");
-    println!("  id   : {}", id.public_b64());
+    println!("  id   : {pubkey_b64}");
     Ok(())
 }
 
@@ -146,6 +147,7 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         &dirs.config.join("identity.key"),
         &dirs.config.join("identity.pub"),
     )?;
+    let pubkey_b64 = id.public_b64();
 
     // network.conf (written by the installer) supplies overlay_ip/relay/control;
     // explicit flags override it. This lets the systemd unit run a bare
@@ -177,28 +179,30 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     let peers_path = arg_value(args, "--peers")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs.config.join("peers"));
+    let control_url = from("--control", "control");
+    let cookie_path = dirs.config.join("cookies.txt");
     // Self-bootstrap: load the durable node token from disk, or acquire it from
     // the control plane via the saved OIDC session cookie and write it to disk
     // so future restarts survive cookie expiry.  Falls back to None when no
     // control URL is configured or the cookie jar is absent.
-    let node_token: Option<String> = from("--control", "control").and_then(|url| {
+    let node_token: Option<String> = control_url.as_ref().and_then(|url| {
         load_or_bootstrap_token(
             &dirs.config.join("node.token"),
-            &url,
-            &dirs.config.join("cookies.txt"),
-            &id.public_b64(),
+            url,
+            &cookie_path,
+            &pubkey_b64,
         )
     });
 
     // Source the peer map from the control plane (`--control <url>`) when
     // available.  Prefer the bearer token so the fetch survives cookie expiry;
     // fall back to the cookie jar when no token is available yet.
-    let peers = match from("--control", "control") {
+    let peers = match control_url.as_ref() {
         Some(url) => {
             let fetched = if let Some(ref tok) = node_token {
-                peers::PeerTable::fetch_with_token(&url, tok)
+                peers::PeerTable::fetch_with_token(url, tok)
             } else {
-                peers::PeerTable::fetch(&url, &dirs.config.join("cookies.txt"))
+                peers::PeerTable::fetch(url, &cookie_path)
             };
             if fetched.is_empty() {
                 peers::PeerTable::load_file(&peers_path)
@@ -247,20 +251,8 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
     eprintln!(
         "{NAME}: tunnel up — overlay {overlay_ip} on {iface}, relay {relay}, {} peer(s), id {}",
         peers.len(),
-        id.public_b64()
+        pubkey_b64
     );
-    // Report liveness to the control plane so peers see this node ONLINE.
-    // Pass the node token (if bootstrapped) so the heartbeat loop uses bearer
-    // auth and keeps working after the session cookie expires.
-    if let Some(control) = from("--control", "control") {
-        heartbeat::spawn(
-            control,
-            dirs.config.join("cookies.txt"),
-            id.public_b64(),
-            node_token.clone(),
-        );
-    }
-
     let cfg = tunnel::TunnelConfig {
         iface,
         overlay_ip,
@@ -272,9 +264,17 @@ fn tunnel_cmd(args: &[String]) -> Result<(), NodeError> {
         advertise,
         exit_node,
         acl,
-        control_url: from("--control", "control"),
-        cookie_jar: Some(dirs.config.join("cookies.txt")),
+        control_url: control_url.clone(),
+        cookie_jar: Some(cookie_path.clone()),
         node_token: node_token.clone(),
+        heartbeat: control_url
+            .clone()
+            .map(|control_url| tunnel::HeartbeatConfig {
+                control_url,
+                cookie_jar: cookie_path.clone(),
+                pubkey_b64,
+                node_token: node_token.clone(),
+            }),
     };
     tunnel::run(cfg)?;
     Ok(())
@@ -320,6 +320,7 @@ fn selftest_cmd(args: &[String]) -> Result<(), NodeError> {
         control_url: None,
         cookie_jar: None,
         node_token: None,
+        heartbeat: None,
     };
     tunnel::selftest(cfg, secs)?;
     Ok(())
@@ -383,6 +384,7 @@ fn echo_peer_cmd(args: &[String]) -> Result<(), NodeError> {
         control_url: None,
         cookie_jar: None,
         node_token: None,
+        heartbeat: None,
     };
     tunnel::echo_peer(cfg, secs)?;
     Ok(())

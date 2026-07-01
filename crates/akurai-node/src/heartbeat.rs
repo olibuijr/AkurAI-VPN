@@ -13,6 +13,7 @@
 //!
 //! Both paths use `curl` — pure-std has no TLS client.
 
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -44,7 +45,7 @@ pub fn fetch_node_id(control_url: &str, cookie_jar: &Path, pubkey_b64: &str) -> 
 }
 
 /// POST a single heartbeat: fetch a fresh dashboard `csrf_token`, then submit our id.
-fn beat(control_url: &str, cookie_jar: &Path, node_id: &str) -> bool {
+fn beat(control_url: &str, cookie_jar: &Path, node_id: &str, endpoint: &str) -> bool {
     let base = control_url.trim_end_matches('/');
     let jar = cookie_jar.to_string_lossy().into_owned();
     let dash = Command::new("curl")
@@ -71,7 +72,7 @@ fn beat(control_url: &str, cookie_jar: &Path, node_id: &str) -> bool {
             "-H",
             "Content-Type: application/json",
             "--data",
-            &format!("{{\"id\":\"{node_id}\",\"endpoint\":\"\"}}"),
+            &heartbeat_body(node_id, endpoint),
             &format!("{base}/api/heartbeat"),
         ])
         .status()
@@ -106,7 +107,7 @@ pub fn fetch_node_id_with_token(
 }
 
 /// POST a single heartbeat using a bearer token — no CSRF fetch required.
-fn beat_with_token(control_url: &str, token: &str, node_id: &str) -> bool {
+fn beat_with_token(control_url: &str, token: &str, node_id: &str, endpoint: &str) -> bool {
     let base = control_url.trim_end_matches('/');
     Command::new("curl")
         .args([
@@ -118,7 +119,7 @@ fn beat_with_token(control_url: &str, token: &str, node_id: &str) -> bool {
             "-H",
             "Content-Type: application/json",
             "--data",
-            &format!("{{\"id\":\"{node_id}\",\"endpoint\":\"\"}}"),
+            &heartbeat_body(node_id, endpoint),
             &format!("{base}/api/heartbeat"),
         ])
         .status()
@@ -136,6 +137,8 @@ pub fn spawn(
     cookie_jar: PathBuf,
     pubkey_b64: String,
     node_token: Option<String>,
+    relay: SocketAddr,
+    tunnel_port: u16,
 ) {
     thread::spawn(move || {
         let resolved = if let Some(ref tok) = node_token {
@@ -156,14 +159,51 @@ pub fn spawn(
         };
         eprintln!("akurai-node: heartbeat to {control_url} as node {id}");
         loop {
+            let endpoint = advertised_endpoint(relay, tunnel_port).unwrap_or_default();
             if let Some(ref tok) = node_token {
-                let _ = beat_with_token(&control_url, tok, &id);
+                let _ = beat_with_token(&control_url, tok, &id, &endpoint);
             } else {
-                let _ = beat(&control_url, &cookie_jar, &id);
+                let _ = beat(&control_url, &cookie_jar, &id, &endpoint);
             }
             thread::sleep(HEARTBEAT_INTERVAL);
         }
     });
+}
+
+/// Resolve the local underlay address that would reach the relay, then replace
+/// its random probe port with the tunnel socket's actual listening port.
+fn advertised_endpoint(relay: SocketAddr, tunnel_port: u16) -> Option<String> {
+    let bind = match relay {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let sock = UdpSocket::bind(bind).ok()?;
+    sock.connect(relay).ok()?;
+    let local = sock.local_addr().ok()?;
+    match local {
+        SocketAddr::V4(v4) if !v4.ip().is_unspecified() => {
+            Some(SocketAddr::from((*v4.ip(), tunnel_port)).to_string())
+        }
+        SocketAddr::V6(v6) if !v6.ip().is_unspecified() => {
+            Some(SocketAddr::from((*v6.ip(), tunnel_port)).to_string())
+        }
+        _ => None,
+    }
+}
+
+fn heartbeat_body(node_id: &str, endpoint: &str) -> String {
+    format!(
+        "{{\"id\":\"{}\",\"endpoint\":\"{}\"}}",
+        json_esc(node_id),
+        json_esc(endpoint)
+    )
+}
+
+fn json_esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Extract a `"key":"value"` or `"key":<number>` JSON field (hand-rolled).
@@ -209,5 +249,21 @@ mod tests {
     fn parses_csrf_token() {
         let html = r#"<input name="csrf_token" value="tok-9f8e" type="hidden">"#;
         assert_eq!(csrf_token(html).as_deref(), Some("tok-9f8e"));
+    }
+
+    #[test]
+    fn heartbeat_body_includes_endpoint() {
+        assert_eq!(
+            heartbeat_body("node-a", "192.168.1.44:51399"),
+            r#"{"id":"node-a","endpoint":"192.168.1.44:51399"}"#
+        );
+    }
+
+    #[test]
+    fn heartbeat_body_escapes_json_values() {
+        assert_eq!(
+            heartbeat_body("node\"a", "192.168.1.44:51399"),
+            r#"{"id":"node\"a","endpoint":"192.168.1.44:51399"}"#
+        );
     }
 }

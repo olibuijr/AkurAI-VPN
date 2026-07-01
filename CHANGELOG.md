@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-01
+
+- LAN-local direct path candidates
+
+
+### Added
+- LAN-local direct path candidates: running nodes now heartbeat their bound UDP
+  endpoint, `/api/peermap` surfaces fresh peer endpoints, and the node probes
+  those candidates before falling back to the relay.
+
+### Fixed
+- Same-LAN peers can upgrade to the local UDP path instead of keeping encrypted
+  overlay traffic on the central relay path.
+
 ## [0.3.3] - 2026-06-29
 
 ### Added
@@ -151,5 +165,4 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 - add deploy conduct comments
 - migrate to akurai-notes MCP; CLAUDE.md->@AGENTS.md; AGENTS.md->pointer
 - initial commit
-
 

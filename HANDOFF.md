@@ -4,6 +4,17 @@ Date: 2026-06-28
 
 This document is the current working handoff for the AkurAI-VPN effort. It captures the live state of the system, what was changed, what remains, and the constraints another agent must preserve while continuing.
 
+## Update — 2026-07-01: LAN-local direct path candidates
+
+Same-LAN peers no longer have to rely on the central relay's observed public/NAT
+endpoint. While `akurai-node tunnel` is running, the node reports its bound UDP port
+plus the local source address used to reach the relay in `/api/heartbeat`; the control
+plane includes that fresh endpoint in `/api/peermap`; and the node probes peer-map
+endpoints before using the relay fallback. A candidate is promoted only after a valid
+frame arrives from a configured peer. Verified locally with `cargo test`, `cargo build
+-p akurai-node -p akurai-relay`, `sudo -n tests/netns/direct.sh`, and `sudo -n
+tests/netns/symmetric.sh`.
+
 ## Update — 2026-06-29 (v0.3.1): self-healing nodes + durable node auth tokens — production hardening
 
 Two production-hardening milestones on top of v0.2.0, both **verified live** on the two Linux nodes (ec2-peer + midget):
@@ -360,4 +371,3 @@ Expected status characteristics:
 - `AkurAI-VPN/CHANGELOG.md`
 - `akurai-vpn-site/frontend/install.sh`
 - `akurai-vpn-site/frontend/index.html`
-

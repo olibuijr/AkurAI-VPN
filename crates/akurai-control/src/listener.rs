@@ -313,14 +313,14 @@ fn route(req: &Request, state: &SharedState) -> Response {
         }
         (Method::Get, "/api/peermap") => {
             if let Some(session) = require_auth(req, state) {
-                handle_peermap(req, &session, state)
-            } else if let Some((user, _ep_id)) = auth_node(req, state) {
+                handle_peermap(req, &session, state, None)
+            } else if let Some((user, ep_id)) = auth_node(req, state) {
                 // Token-auth: build a synthetic AuthSession (csrf_token unused for peermap).
                 let session = AuthSession {
                     user,
                     csrf_token: String::new(),
                 };
-                handle_peermap(req, &session, state)
+                handle_peermap(req, &session, state, Some(&ep_id))
             } else {
                 Response {
                     status: "401 Unauthorized",
@@ -529,9 +529,14 @@ fn handle_list_endpoints(session: &AuthSession, state: &SharedState) -> Response
 /// node, identified by an optional `?self=<node_id>`), each with overlay IPv4,
 /// public key, name, and liveness. Generation is delegated to [`peermap`] so the
 /// pure mapping logic stays unit-testable without an HTTP request.
-fn handle_peermap(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+fn handle_peermap(
+    req: &Request,
+    session: &AuthSession,
+    state: &SharedState,
+    default_self_id: Option<&str>,
+) -> Response {
     let params = parse_query(&req.query);
-    let self_id = params.get("self").map(String::as_str);
+    let self_id = params.get("self").map(String::as_str).or(default_self_id);
     let st = match state.lock() {
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
@@ -1335,7 +1340,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             body: String::new(),
         };
-        let resp = handle_peermap(&req, &session, &state);
+        let resp = handle_peermap(&req, &session, &state, None);
         assert_eq!(resp.status, "200 OK");
         // The node named by ?self= is excluded; the peer is present.
         assert!(!resp.body.contains("name-self-node"));
@@ -1372,7 +1377,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             body: String::new(),
         };
-        let resp = handle_peermap(&req, &session, &state);
+        let resp = handle_peermap(&req, &session, &state, None);
         assert!(resp.body.contains("name-mine"));
         assert!(resp.body.contains("\"online\":true"));
         // Another tenant's node is never disclosed.
@@ -1450,7 +1455,7 @@ mod tests {
         assert!(auth_node(&req, &state).is_none());
     }
 
-    /// `GET /api/peermap` with a valid bearer token returns the user's own peers.
+    /// `GET /api/peermap` with a valid bearer token returns the user's other peers.
     #[test]
     fn peermap_via_token_header_returns_user_peers() {
         let state = crate::state::new_shared();
@@ -1460,6 +1465,8 @@ mod tests {
             let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
             my_ep.node_token = tok.clone();
             st.endpoints.push(my_ep);
+            st.endpoints
+                .push(ep("peer", "user@example.com", &["100.88.0.4/32"]));
             // Another tenant's endpoint — must not appear.
             st.endpoints
                 .push(ep("theirs", "other@example.com", &["100.88.0.3/32"]));
@@ -1476,8 +1483,12 @@ mod tests {
         let resp = route(&req, &state);
         assert_eq!(resp.status, "200 OK");
         assert!(
-            resp.body.contains("name-mine"),
-            "own peer should be present"
+            !resp.body.contains("name-mine"),
+            "token-auth peermap should exclude the requesting node"
+        );
+        assert!(
+            resp.body.contains("name-peer"),
+            "same-tenant peer should be present"
         );
         assert!(
             !resp.body.contains("name-theirs"),

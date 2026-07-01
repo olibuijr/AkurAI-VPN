@@ -70,16 +70,18 @@ gateway advertisement (those are MVP2, **NOT YET BUILT**).
    ├─ dest = packet bytes [16..20]
    ├─ peer = peers.get(dest)           ── unknown dest → DROP (fail-closed)
    ├─ if session established:  ct = session.encrypt(packet)
-   │                           send Frame{Data, src=self, dest, ct} to relay
+   │                           send Frame{Data, src=self, dest, ct}
+   │                           to confirmed direct path, else relay
    └─ else (first contact):    noise::initiate → send Frame{HandshakeInit,…}
+                               to direct candidate first + relay fallback
                                drop this packet (TCP/ICMP retransmits later)
    │
-   ▼  UDP socket (connected to the relay; src endpoint kept fresh by a
-   │             Keepalive frame every 20 s)
+   ▼  UDP socket (bound once; `send_to` relay or direct peer endpoint)
    ▼
  akurai-relay (forward.rs): decode envelope → learn src endpoint →
                             forward datagram to dest overlay IP's learned UDP endpoint
                             (unknown dest → DROP). Never decrypts; holds no keys.
+                            On handshakes, send PeerAddr hints to both ends.
    │
    ▼  UDP at peer
    ▼  udp_pump (peer's akurai-node/src/tunnel.rs)
@@ -88,26 +90,33 @@ gateway advertisement (those are MVP2, **NOT YET BUILT**).
    │                  Frame{HandshakeResp,…}
    ├─ HandshakeResp → noise::finalize the pending handshake → session established
    ├─ Data          → session.decrypt(payload) → write inner IPv4 packet to akurai0
-   └─ Keepalive     → ignored (only the relay learns from these)
+   ├─ PeerAddr      → remember/probe candidate endpoint for a direct path
+   └─ Keepalive     → direct-path confirmation handled before dispatch;
+                      relay keepalives otherwise only teach the relay
    │
    ▼
  akurai0 TUN → local app on the peer
 ```
 
 The two pumps (`tun_pump` on the main thread, `udp_pump` on a second thread) share a
-per-peer `SessionTable` (`established` + `pending` handshakes) under a `Mutex`. A third
-thread sends the 20-second keepalive. The node binds `0.0.0.0:0` and `connect()`s the
-relay, so all node↔relay traffic is one UDP flow. End to end, the relay only ever
-forwards ciphertext.
+per-peer `PeerState` (`session`, `pending`, `direct`, `candidate`) under a `Mutex`. A
+third thread sends keepalives to the relay and to direct candidates/paths. The node
+binds `0.0.0.0:0`; while running it reports the bound UDP port plus the local source
+address used to reach the relay in `/api/heartbeat`. `/api/peermap` returns that fresh
+endpoint to same-user peers, which lets two devices on the same LAN probe each other
+directly instead of keeping traffic on the central relay path. End to end, the relay
+only ever forwards ciphertext.
 
 ### Node sources of the peer table (`akurai-node/src/peers.rs`)
 
-- Static file `config/peers`: one `<overlay_ip> <pubkey_b64> [name]` per line; blank
+- Static file `config/peers`: one
+  `<overlay_ip> <pubkey_b64> [name] [advertised] [tags] [endpoint]` per line; blank
   lines and `#` comments ignored; unparseable lines skipped (used for tests and offline
   bring-up).
 - Control plane `GET /api/peermap` via `curl` with the saved cookie jar
   (`--control <url>`); pure-`std` has no TLS client, and the node already shells `ip`,
   so `curl` is consistent. JSON is parsed by a hand-rolled, dependency-free reader.
+  Peer-map entries include an optional `endpoint` direct-path candidate.
 - Fail-closed: an entry that does not parse is skipped; a packet to a destination not in
   the table is dropped.
 
@@ -155,6 +164,12 @@ cargo build -p akurai-node -p akurai-relay
 
 # End-to-end overlay proof (needs root for netns + TUN; touches no host interface):
 sudo tests/netns/e2e.sh
+
+# Direct path proof on one LAN:
+sudo tests/netns/direct.sh
+
+# Symmetric NAT proof: direct path does not form, relay fallback still works:
+sudo tests/netns/symmetric.sh
 ```
 
 A clean run prints `OVERLAY_PING: PASS`, `CIPHERTEXT_CHECK: PASS`, and
@@ -162,7 +177,8 @@ A clean run prints `OVERLAY_PING: PASS`, `CIPHERTEXT_CHECK: PASS`, and
 
 ## Not yet built
 
-- **Direct peer mesh / NAT traversal** (MVP3) — every packet transits the relay today.
+- **Advanced path scoring / ICE-style NAT traversal** — LAN/cone-NAT direct paths and
+  symmetric-NAT relay fallback exist; richer candidate scoring remains future work.
 - **Subnet / exit / gateway routes** (MVP2) — the node installs the overlay-only route
   and never a default route.
 - **MagicDNS / internal DNS names** (`akurai-dns`) — placeholder.

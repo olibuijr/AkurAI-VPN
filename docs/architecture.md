@@ -1,10 +1,12 @@
 # AkurAI VPN — Architecture (data plane)
 
-AkurAI VPN is a private, encrypted L3 overlay network. In MVP1 it is **hub-routed**:
-every node sends all overlay traffic to a single relay, which forwards each datagram
-to the destination's last-known UDP endpoint. The relay never holds payload keys — it
-moves end-to-end ciphertext. This document describes what is actually built and
-deployed; aspirational features are explicitly marked **NOT YET BUILT**.
+AkurAI VPN is a private, encrypted L3 overlay network. The data plane uses direct
+peer paths with relay fallback: peers prefer a confirmed direct UDP address
+(including same-LAN private addresses advertised through heartbeat), and use the
+central relay only until a direct path is proven or when direct UDP cannot work. The
+relay never holds payload keys — it moves end-to-end ciphertext. This document
+describes what is actually built and deployed; aspirational features are explicitly
+marked **NOT YET BUILT**.
 
 The whole shipped data plane is **pure Rust, `std`-only, zero runtime dependencies**.
 The single `unsafe` in the codebase is one `ioctl` to create the TUN device
@@ -13,8 +15,9 @@ safe `std`. Data-plane cryptography is hand-rolled in `akurai-crypto` against RF
 vectors (decision resolved 2026-06-27: keep the zero-dependency identity rather than
 link rustls/quinn/snow/ed25519; the hand-rolled-crypto risk is accepted deliberately).
 
-Workspace version: `0.1.0`. The first working encrypted overlay mesh landed in the
-`0.1.0` changelog entry (2026-06-29).
+Workspace version: `0.3.3` plus current unreleased LAN-local direct-path work. The
+first working encrypted overlay mesh landed in the `0.1.0` changelog entry
+(2026-06-29).
 
 ## Components (crates)
 
@@ -24,9 +27,9 @@ Workspace version: `0.1.0`. The first working encrypted overlay mesh landed in t
 | `akurai-crypto` | Zero-dep crypto primitives | `x25519` (RFC 7748), `chacha20poly1305` (RFC 8439), `blake2s` (RFC 7693), `hkdf`; each verified against official RFC vectors in-crate |
 | `akurai-transport` | Secure channel | `noise` (WireGuard-style `Noise_IK` handshake), `session` (counter-nonce data packets + 64-entry replay window), `Keypair`/`TransportKeys` |
 | `akurai-sys` | The OS seam | `raw` (the only `unsafe` — one `ioctl(TUNSETIFF)` via a direct `syscall`), `tun` (`create` → `/dev/net/tun` handle, `IFF_TUN | IFF_NO_PI`) |
-| `akurai-node` | Node daemon | `identity` (persistent X25519 static keypair), `peers` (overlay-IP-indexed peer table), `tunnel` (the TUN↔UDP pump), `main` (CLI: `install`/`up`/`down`/`tunnel`/`status`/`path`/`version`) |
-| `akurai-relay` | Ciphertext-only hub | `forward` (learn src endpoint, forward by dest overlay IP, drop unknown; holds no keys, links no crypto crate) |
-| `akurai-control` | Control plane (HTTP) | `ipam` (overlay IP allocation), `peermap` (`/api/peermap`), `heartbeat` (`/api/heartbeat`, liveness TTL), `listener` (auth + CSRF + endpoint CRUD) |
+| `akurai-node` | Node daemon | `identity` (persistent X25519 static keypair), `peers` (overlay-IP-indexed peer table + direct endpoint candidates), `tunnel` (the TUN↔UDP pump with direct path + relay fallback), `main` (CLI: `install`/`up`/`down`/`tunnel`/`status`/`path`/`version`) |
+| `akurai-relay` | Ciphertext-only fallback hub | `forward` (learn src endpoint, forward by dest overlay IP, send `PeerAddr` hints during handshakes, drop unknown; holds no keys, links no crypto crate) |
+| `akurai-control` | Control plane (HTTP) | `ipam` (overlay IP allocation), `peermap` (`/api/peermap` with fresh endpoint candidates), `heartbeat` (`/api/heartbeat`, liveness TTL + node UDP endpoint), `listener` (auth + CSRF + endpoint CRUD) |
 | `akurai-admin` | Admin CLI | users/devices/ACLs/routes (early; data-plane policy NOT YET wired) |
 | `akurai-dns` | Internal/MagicDNS | placeholder — **NOT YET BUILT** (folded into control plane later) |
 
@@ -55,30 +58,33 @@ akurai-control  (separate process: IPAM + peer map + heartbeat over HTTP; uses
 - The **relay** sees only the `Frame` envelope. The **node** is the only place that
   holds session keys and does encryption/decryption.
 
-## The hub-routed MVP1 model
+## Direct Path With Relay Fallback
 
 ```text
- node A (100.88.0.2)                relay (hub)                node B (100.88.0.3)
+ node A (100.88.0.2)              direct UDP               node B (100.88.0.3)
    app → akurai0 TUN                 forward.rs                 akurai0 TUN → app
         │                          (no keys held)                     ▲
         │  UDP: AkurAI Frame                                          │
         │  {Data, src=.2, dest=.3, ciphertext}                        │
-        └───────────────────────────►  learn src endpoint  ──────────┘
-                                       forward by dest IP
+        ├─────────────────────────────────────────────────────────────┘
+        │
+        └──────── relay fallback until direct is confirmed ──────────►
 ```
 
-1. Each node connects a UDP socket to the relay and periodically sends a `Keepalive`
-   frame (every 20 s). The relay learns "overlay IP X is reachable at UDP address Y".
-2. To reach a peer, the node runs a `Noise_IK` handshake **end to end** (the handshake
-   messages travel as relay frames the relay forwards blindly), then encrypts each
-   inner IPv4 packet into a `Data` frame.
-3. The relay forwards each frame to the destination overlay IP's last-known endpoint.
-   It never decrypts; for `Data` frames the payload is ciphertext it cannot read.
-4. **Fail-closed** throughout: a packet to an unknown destination (node side: not in
+1. Each node binds one UDP socket and sends `Keepalive` frames to the relay so the
+   relay can forward fallback traffic.
+2. The node also heartbeats its current local UDP endpoint to the control plane.
+   `/api/peermap` returns fresh same-user peers with overlay IP, public key,
+   liveness, and the best direct endpoint candidate.
+3. To reach a peer, the node runs a `Noise_IK` handshake **end to end**. It tries a
+   direct candidate first when one is known and keeps relay fallback available. The
+   relay additionally sends `PeerAddr` hints during handshakes with the addresses it
+   observes.
+4. A direct address is only promoted after a valid frame arrives from a configured
+   peer. Once confirmed, `Data` frames go peer-to-peer; if no direct path forms, the
+   relay forwards ciphertext by destination overlay IP.
+5. **Fail-closed** throughout: a packet to an unknown destination (node side: not in
    the peer table; relay side: endpoint not yet learned) is dropped, never buffered.
-
-There is no direct node-to-node path and no NAT traversal in MVP1 — all traffic
-transits the hub.
 
 ## What is deployed live
 
@@ -99,12 +105,14 @@ transits the hub.
 | **MVP0** | Planning, threat model, protocol decision (Noise-over-UDP, hand-rolled), DNS/deploy plan | **DONE** |
 | **MVP1** | Single-hub internal VPN: enrollment + static/served peer map, TUN creation, end-to-end-encrypted node↔node tunnel via the relay, overlay IP allocation, netns e2e proof | **DONE** |
 | **MVP2** | Gateway routes: subnet advertisement, admin route approval, route push to clients, exit-gateway opt-in, basic DNS names | NOT YET BUILT |
-| **MVP3** | Direct peer mesh: endpoint discovery, direct UDP attempts, NAT traversal, relay fallback, path-health scoring, roaming | NOT YET BUILT |
+| **MVP3** | Direct peer mesh: endpoint discovery, direct UDP attempts, NAT traversal, relay fallback, path-health scoring, roaming | **PARTIAL/DONE** for LAN/cone-NAT direct paths + symmetric-NAT relay fallback; advanced scoring remains future work |
 | **MVP4** | Public ingress: HTTPS ingress on the control host to internal services, TLS automation, identity-aware access | NOT YET BUILT |
 
 ### Explicitly not yet built
 
-- **Direct mesh / NAT traversal** — MVP3. Every packet currently transits the relay.
+- **Advanced path scoring / ICE-style NAT traversal** — current direct paths use
+  heartbeat endpoint candidates plus relay `PeerAddr` hints, with symmetric-NAT
+  relay fallback; richer scoring and candidate sets are future work.
 - **Subnet / exit / gateway routes** — MVP2. The node installs an overlay-only route
   and *never* a default route.
 - **MagicDNS / internal DNS** (`akurai-dns`) — placeholder crate.

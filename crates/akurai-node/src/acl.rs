@@ -110,6 +110,7 @@ mod tests {
             overlay_ip: Ipv4Addr::new(100, 88, 0, 9),
             public_key: [0u8; 32],
             name: name.into(),
+            endpoint: None,
             advertised: vec![],
             tags: tags.iter().map(|t| Tag((*t).to_string())).collect(),
         }

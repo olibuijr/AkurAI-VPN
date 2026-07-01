@@ -42,7 +42,8 @@ Constants: `HEADER_LEN = 14`, `MAX_PAYLOAD = 2048`.
 | 1 | `Keepalive` | Node→relay liveness; teaches the relay this `src` overlay IP's UDP endpoint. Payload empty. **Not forwarded.** |
 | 2 | `HandshakeInit` | Noise_IK message 1 (initiator → responder), payload-opaque (96 B) |
 | 3 | `HandshakeResp` | Noise_IK message 2 (responder → initiator), payload-opaque (48 B) |
-| 4 | `Data` | An end-to-end-encrypted inner IPv4 packet (ciphertext to the relay) |
+| 4 | `Data` | An end-to-end-encrypted inner IPv4 packet (ciphertext to the relay or direct peer path) |
+| 5 | `PeerAddr` | Relay→node direct-path hint. Payload is IPv4 socket address: 4 octets + 2-byte big-endian UDP port. |
 
 `Frame::encode()` lays the bytes out exactly as above. `Frame::decode()` is
 **fail-closed** and never panics — it returns `None` on any of: buffer shorter than
@@ -172,7 +173,7 @@ A 64-entry sliding window (`WINDOW = 64`) over `recv_max` / `recv_mask`:
 window, or a packet shorter than 8 bytes. In-window reordering is accepted; each packet
 decrypts exactly once.
 
-## Endpoint learning (relay)
+## Endpoint Learning And Direct Candidates
 
 The relay keeps `HashMap<overlay_ip, UDP_endpoint>`. For every received frame whose
 `src` is not `0.0.0.0`, it records "this `src` is reachable at the UDP address the
@@ -182,12 +183,27 @@ or data frame. `Keepalive` frames only teach the relay and are not forwarded. A
 (`dropped_unknown`); the relay never buffers unbounded state. Counters tracked:
 `learned`, `forwarded`, `dropped_unknown`, `malformed`.
 
+During `HandshakeInit` / `HandshakeResp` forwarding, the relay sends each side a
+`PeerAddr` hint containing the other side's relay-observed IPv4 UDP endpoint. Nodes
+store the hint as an unconfirmed candidate and probe it with keepalives. Separately,
+while the tunnel is running, each node heartbeats the local UDP endpoint it would use
+to reach the relay; `/api/peermap` surfaces that fresh endpoint to the user's other
+nodes. This is what lets same-LAN devices try their private LAN path even though the
+central relay only observes their public/NAT path.
+
+A candidate is never trusted just because the control plane or relay supplied it. The
+node only promotes a direct path after a valid frame arrives from a configured peer
+overlay IP; until then, encrypted traffic keeps relay fallback.
+
 ## Fail-closed rules (summary)
 
 - **Frame decode:** any malformed envelope → dropped (`Frame::decode` returns `None`).
 - **Node, outbound:** a TUN packet whose destination overlay IP is not in the peer table
   is dropped. First contact triggers a handshake and the triggering packet is dropped
   (upper-layer TCP/ICMP retransmits once a session exists).
+- **Node, direct candidates:** a heartbeat or `PeerAddr` endpoint is only a probe
+  target. It becomes the data path only after a frame from the configured peer arrives
+  and the normal peer/static-key checks pass.
 - **Node, inbound `HandshakeInit`:** the responder accepts only if the Noise-recovered
   initiator static key matches the peer-table entry for `frame.src`
   (`p.public_key == init_pub`); otherwise the handshake is dropped — no session, no

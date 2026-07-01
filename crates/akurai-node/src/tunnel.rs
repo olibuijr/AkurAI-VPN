@@ -39,6 +39,16 @@ use akurai_transport::Keypair;
 use crate::acl::Acl;
 use crate::peers::PeerTable;
 
+/// Control-plane heartbeat settings. `tunnel::run` starts the heartbeat after
+/// the UDP socket is bound, so the reported endpoint uses the real tunnel port.
+#[derive(Clone)]
+pub struct HeartbeatConfig {
+    pub control_url: String,
+    pub cookie_jar: PathBuf,
+    pub pubkey_b64: String,
+    pub node_token: Option<String>,
+}
+
 /// Runtime configuration for the data-plane daemon.
 // Several fields drive interface/route setup, which is fully exercised only on the
 // Linux gateway path; the macOS client path uses a subset and the Windows stub none.
@@ -75,6 +85,9 @@ pub struct TunnelConfig {
     /// session cookie — so the refresh survives cookie expiry. `None` ⇒ fall
     /// back to cookie-jar auth (requires a valid session cookie).
     pub node_token: Option<String>,
+    /// Optional control-plane heartbeat. Started after the UDP socket is bound
+    /// so the advertised endpoint can carry the current direct UDP candidate.
+    pub heartbeat: Option<HeartbeatConfig>,
 }
 
 /// Per-peer session + path state, shared between the pump threads.
@@ -123,6 +136,30 @@ fn parse_addr(payload: &[u8]) -> Option<SocketAddr> {
     let ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
     let port = u16::from_be_bytes([payload[4], payload[5]]);
     Some(SocketAddr::from((ip, port)))
+}
+
+/// Pick outbound addresses for first-contact handshakes. A confirmed direct path
+/// is used by itself. A candidate path is tried first with relay fallback. When
+/// the control plane advertises a peer endpoint, seed it as the candidate.
+fn handshake_paths(
+    st: &mut PeerState,
+    relay: SocketAddr,
+    advertised: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if let Some(direct) = st.direct {
+        return vec![direct];
+    }
+    if st.candidate.is_none() {
+        st.candidate = advertised;
+    }
+    let mut paths = Vec::new();
+    if let Some(candidate) = st.candidate {
+        if candidate != relay {
+            paths.push(candidate);
+        }
+    }
+    paths.push(relay);
+    paths
 }
 
 /// Bring up the overlay interface. Platform-specific: Linux uses `ip`/`sysctl`,
@@ -312,6 +349,7 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
 
     let sock = Arc::new(UdpSocket::bind(("0.0.0.0", 0))?);
     let relay = cfg.relay;
+    let heartbeat = cfg.heartbeat.clone();
     let table: Arc<Mutex<Table>> = Arc::new(Mutex::new(HashMap::new()));
     let control_url = cfg.control_url;
     let cookie_jar = cfg.cookie_jar;
@@ -322,6 +360,18 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     // ACL is consulted only on the outbound (TUN→UDP) path, which runs on this
     // thread, so it need not be shared with the UDP pump.
     let acl = cfg.acl;
+
+    if let Some(hb) = heartbeat {
+        let port = sock.local_addr()?.port();
+        crate::heartbeat::spawn(
+            hb.control_url,
+            hb.cookie_jar,
+            hb.pubkey_b64,
+            hb.node_token,
+            relay,
+            port,
+        );
+    }
 
     // MagicDNS: resolve `<peer-name>.akurai` (and bare `<peer-name>`) to a peer\'s
     // overlay IP, served on the node\'s own overlay IP:53.
@@ -343,6 +393,7 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     {
         let sock = Arc::clone(&sock);
         let table = Arc::clone(&table);
+        let peers = Arc::clone(&peers);
         thread::spawn(move || loop {
             if let Some(f) = Frame::new(
                 FrameKind::Keepalive,
@@ -352,12 +403,31 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
             ) {
                 let bytes = f.encode();
                 let _ = sock.send_to(&bytes, relay);
-                if let Ok(t) = table.lock() {
-                    for st in t.values() {
-                        if let Some(a) = st.direct.or(st.candidate) {
-                            let _ = sock.send_to(&bytes, a);
+                let addrs = {
+                    let advertised = {
+                        let pt = Arc::clone(&*peers.read().unwrap());
+                        pt.direct_endpoints()
+                    };
+                    let mut addrs = Vec::new();
+                    if let Ok(mut t) = table.lock() {
+                        for (peer_ip, endpoint) in advertised {
+                            let st = t.entry(peer_ip).or_default();
+                            if st.direct.is_none() && st.candidate != Some(endpoint) {
+                                st.candidate = Some(endpoint);
+                            }
+                        }
+                        for st in t.values() {
+                            if let Some(a) = st.direct.or(st.candidate) {
+                                if a != relay {
+                                    addrs.push(a);
+                                }
+                            }
                         }
                     }
+                    addrs
+                };
+                for addr in addrs {
+                    let _ = sock.send_to(&bytes, addr);
                 }
             }
             thread::sleep(Duration::from_secs(15));
@@ -372,7 +442,6 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
     if let Some(url) = control_url {
         let peers_rw = Arc::clone(&peers);
         thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(30));
             let fetched = if let Some(ref tok) = node_token {
                 PeerTable::fetch_with_token(&url, tok)
             } else if let Some(ref jar) = cookie_jar {
@@ -385,6 +454,7 @@ pub fn run(cfg: TunnelConfig) -> io::Result<()> {
                 *peers_rw.write().unwrap() = Arc::new(fetched);
                 eprintln!("akurai-node: peers refreshed — {n} peer(s)");
             }
+            thread::sleep(Duration::from_secs(30));
         });
     }
 
@@ -670,29 +740,36 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
         }
         let peer_ip = peer.overlay_ip;
         let peer_pub = peer.public_key;
+        let peer_endpoint = peer.endpoint;
         // pt (and the peer borrow) are no longer needed past this point.
         drop(pt);
 
-        let mut out: Option<(Vec<u8>, SocketAddr)> = None;
+        let mut out: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
         {
             let mut t = table.lock().unwrap();
             let st = t.entry(peer_ip).or_default();
             if let Some(sess) = st.session.as_mut() {
                 let ct = sess.encrypt(pkt);
                 let addr = st.direct.unwrap_or(relay);
-                out = Frame::new(FrameKind::Data, my_ip, peer_ip, ct).map(|f| (f.encode(), addr));
+                if let Some(f) = Frame::new(FrameKind::Data, my_ip, peer_ip, ct) {
+                    out.push((f.encode(), addr));
+                }
             } else if st.pending.is_none() {
                 // First contact: initiate via the relay and drop this packet (the
                 // upper layer retransmits once a session exists).
                 if let Ok(eph) = rand32() {
                     let (state, msg1) = noise::initiate(&kp, &peer_pub, &eph);
                     st.pending = Some(state);
-                    out = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1)
-                        .map(|f| (f.encode(), relay));
+                    if let Some(f) = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1) {
+                        let bytes = f.encode();
+                        for addr in handshake_paths(st, relay, peer_endpoint) {
+                            out.push((bytes.clone(), addr));
+                        }
+                    }
                 }
             }
         }
-        if let Some((bytes, addr)) = out {
+        for (bytes, addr) in out {
             let _ = sock.send_to(&bytes, addr);
         }
     }
@@ -773,8 +850,19 @@ fn udp_pump(pump: Pump) {
                 if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
                     match ptab.get(&frame.src) {
                         Some(p) if p.public_key == init_pub => {
-                            table.lock().unwrap().entry(frame.src).or_default().session =
-                                Some(Session::new(keys));
+                            let install = {
+                                let mut t = table.lock().unwrap();
+                                let st = t.entry(frame.src).or_default();
+                                if st.session.is_none() {
+                                    st.session = Some(Session::new(keys));
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if !install {
+                                continue;
+                            }
                             if let Some(reply) =
                                 Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
                             {

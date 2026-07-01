@@ -162,6 +162,7 @@ mod tests {
             FrameKind::HandshakeInit,
             FrameKind::HandshakeResp,
             FrameKind::Data,
+            FrameKind::PeerAddr,
         ] {
             let f = Frame::new(kind, ip(100, 88, 0, 9), ip(0, 0, 0, 0), vec![1, 2, 3]).unwrap();
             assert_eq!(Frame::decode(&f.encode()).unwrap().kind, kind);
