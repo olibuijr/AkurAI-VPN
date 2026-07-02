@@ -18,5 +18,50 @@
 # Config: akurai-deploy.toml. Engine: `akurai-ec2 release` (see _AWSEC2 skill).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-command -v akurai-ec2 >/dev/null || { echo "✗ akurai-ec2 not on PATH — install the AkurAI ops CLI" >&2; exit 1; }
-exec akurai-ec2 release "$@"
+AKURAI_EC2="${AKURAI_EC2:-$(command -v akurai-ec2 || true)}"
+if [ -z "$AKURAI_EC2" ] && [ -x "../akurai-ec2/bin/akurai-ec2" ]; then
+  AKURAI_EC2="../akurai-ec2/bin/akurai-ec2"
+fi
+[ -n "$AKURAI_EC2" ] || { echo "✗ akurai-ec2 not found — install the AkurAI ops CLI or set AKURAI_EC2" >&2; exit 1; }
+
+dry_run=0
+for arg in "$@"; do
+  [ "$arg" = "--dry-run" ] && dry_run=1
+done
+
+"$AKURAI_EC2" release "$@"
+
+if [ "$dry_run" = 1 ]; then
+  exit 0
+fi
+
+TARGET="${AKURAI_VPN_TARGET:-x86_64-unknown-linux-musl}"
+REMOTE_TMP="/tmp/akurai-vpn-sidecars-$$"
+
+echo "▸ build sidecars: akurai-node + akurai-relay"
+rustup target add "$TARGET" >/dev/null 2>&1 || true
+cargo build --release --target "$TARGET" -p akurai-node -p akurai-relay
+
+echo "▸ deploy sidecars to EC2"
+"$AKURAI_EC2" ssh "mkdir -p '$REMOTE_TMP'"
+"$AKURAI_EC2" ship "target/$TARGET/release/akurai-node" "$REMOTE_TMP/akurai-node"
+"$AKURAI_EC2" ship "target/$TARGET/release/akurai-relay" "$REMOTE_TMP/akurai-relay"
+
+"$AKURAI_EC2" ssh "set -euo pipefail
+sudo install -m 0755 -o root -g root '$REMOTE_TMP/akurai-node' /usr/local/bin/akurai-node
+sudo mkdir -p /opt/akurai-peer/bin /opt/akurai-peer/config /opt/akurai-vpn-relay/bin
+sudo install -m 0755 -o root -g root '$REMOTE_TMP/akurai-node' /opt/akurai-peer/bin/akurai-node
+sudo install -m 0755 -o ubuntu -g ubuntu '$REMOTE_TMP/akurai-relay' /opt/akurai-vpn-relay/bin/akurai-relay
+sudo tee /opt/akurai-peer/config/network.conf >/dev/null <<'EOF'
+overlay_ip=100.88.0.4
+relay=127.0.0.1:51820
+control=https://vpn.olibuijr.com
+EOF
+sudo systemctl restart akurai-vpn-relay.service
+sudo systemctl restart akurai-node.service
+sleep 2
+systemctl is-active akurai-vpn-relay.service
+systemctl is-active akurai-node.service
+/opt/akurai-vpn-relay/bin/akurai-relay version
+/usr/local/bin/akurai-node version
+rm -rf '$REMOTE_TMP'"
