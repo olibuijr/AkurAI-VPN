@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use akurai_common::frame::{Frame, FrameKind};
 use akurai_transport::noise::{self, Initiator};
@@ -96,7 +96,7 @@ struct PeerState {
     /// Completed Noise session (None until the handshake finishes).
     session: Option<Session>,
     /// In-flight handshake we initiated.
-    pending: Option<Initiator>,
+    pending: Option<(Initiator, Instant)>,
     /// A confirmed direct UDP path — outbound frames go here instead of the relay.
     direct: Option<SocketAddr>,
     /// A direct address learned from a relay `PeerAddr` hint, being probed but
@@ -105,6 +105,10 @@ struct PeerState {
 }
 
 type Table = HashMap<Ipv4Addr, PeerState>;
+
+/// Retry a handshake when its response is lost instead of remaining stuck
+/// until the daemon is restarted.
+const HANDSHAKE_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 /// The handles both pump loops share: the TUN, the UDP socket, the per-peer
 /// state table, the peer/routing table, this node\'s keypair, its overlay IP,
@@ -750,16 +754,24 @@ fn tun_pump(pump: Pump, acl: Option<Acl>) -> io::Result<()> {
             let st = t.entry(peer_ip).or_default();
             if let Some(sess) = st.session.as_mut() {
                 let ct = sess.encrypt(pkt);
-                let addr = st.direct.unwrap_or(relay);
                 if let Some(f) = Frame::new(FrameKind::Data, my_ip, peer_ip, ct) {
-                    out.push((f.encode(), addr));
+                    // Route established traffic through the relay. Sending the
+                    // same ciphertext over direct and relay paths would make the
+                    // second copy trip the replay window and look like a lost
+                    // session to the recovery logic. Relay-only delivery also
+                    // survives a peer restart changing its ephemeral UDP port.
+                    out.push((f.encode(), relay));
                 }
-            } else if st.pending.is_none() {
+            } else if st
+                .pending
+                .as_ref()
+                .is_none_or(|(_, started)| started.elapsed() >= HANDSHAKE_RETRY_AFTER)
+            {
                 // First contact: initiate via the relay and drop this packet (the
                 // upper layer retransmits once a session exists).
                 if let Ok(eph) = rand32() {
                     let (state, msg1) = noise::initiate(&kp, &peer_pub, &eph);
-                    st.pending = Some(state);
+                    st.pending = Some((state, Instant::now()));
                     if let Some(f) = Frame::new(FrameKind::HandshakeInit, my_ip, peer_ip, msg1) {
                         let bytes = f.encode();
                         for addr in handshake_paths(st, relay, peer_endpoint) {
@@ -850,18 +862,13 @@ fn udp_pump(pump: Pump) {
                 if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
                     match ptab.get(&frame.src) {
                         Some(p) if p.public_key == init_pub => {
-                            let install = {
+                            {
                                 let mut t = table.lock().unwrap();
                                 let st = t.entry(frame.src).or_default();
-                                if st.session.is_none() {
-                                    st.session = Some(Session::new(keys));
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-                            if !install {
-                                continue;
+                                // The authenticated peer may have restarted and
+                                // lost its old session while we retained ours.
+                                st.session = Some(Session::new(keys));
+                                st.pending = None;
                             }
                             if let Some(reply) =
                                 Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
@@ -876,20 +883,51 @@ fn udp_pump(pump: Pump) {
             FrameKind::HandshakeResp => {
                 let mut t = table.lock().unwrap();
                 let st = t.entry(frame.src).or_default();
-                if let Some(state) = st.pending.take() {
+                if let Some((state, _)) = st.pending.take() {
                     if let Some(keys) = noise::finalize(state, &frame.payload) {
                         st.session = Some(Session::new(keys));
                     }
                 }
             }
             FrameKind::Data => {
-                let mut t = table.lock().unwrap();
-                if let Some(st) = t.get_mut(&frame.src) {
-                    if let Some(sess) = st.session.as_mut() {
-                        if let Some(pt) = sess.decrypt(&frame.payload) {
-                            drop(t);
-                            let _ = tun.send(&pt);
-                        }
+                let plaintext = {
+                    let mut t = table.lock().unwrap();
+                    t.get_mut(&frame.src)
+                        .and_then(|st| st.session.as_mut())
+                        .and_then(|sess| sess.decrypt(&frame.payload))
+                };
+                if let Some(pt) = plaintext {
+                    let _ = tun.send(&pt);
+                    continue;
+                }
+
+                // The sender may still hold a session that we lost during a
+                // restart. Reactively initiate a fresh handshake so recovery
+                // does not require application traffic in the reverse direction.
+                let Some(peer) = ptab.get(&frame.src) else {
+                    continue;
+                };
+                let Ok(eph) = rand32() else { continue };
+                let mut outbound = None;
+                {
+                    let mut t = table.lock().unwrap();
+                    let st = t.entry(frame.src).or_default();
+                    let retry = st
+                        .pending
+                        .as_ref()
+                        .is_none_or(|(_, started)| started.elapsed() >= HANDSHAKE_RETRY_AFTER);
+                    if retry {
+                        let (state, msg1) = noise::initiate(&kp, &peer.public_key, &eph);
+                        st.session = None;
+                        st.pending = Some((state, Instant::now()));
+                        outbound = Frame::new(FrameKind::HandshakeInit, my_ip, frame.src, msg1)
+                            .map(|f| f.encode());
+                    }
+                }
+                if let Some(bytes) = outbound {
+                    let _ = sock.send_to(&bytes, from);
+                    if from != relay {
+                        let _ = sock.send_to(&bytes, relay);
                     }
                 }
             }

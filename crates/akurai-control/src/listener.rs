@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn endpoint_list_is_scoped_to_authenticated_user() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn delete_endpoint_cannot_remove_another_users_node() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn rotate_token_reissues_for_owned_node_and_rejects_others() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             let mut mine = ep("mine", "user@example.com", &["100.88.0.2/32"]);
@@ -1282,7 +1282,7 @@ mod tests {
 
     #[test]
     fn heartbeat_records_endpoint_and_timestamp_for_owned_node() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             st.endpoints
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn heartbeat_rejects_node_not_owned_by_user() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             st.endpoints
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn peermap_handler_excludes_self_query_param() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             st.endpoints
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn peermap_handler_is_scoped_to_user_and_reports_liveness() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         let now = crate::vpn_endpoint::now_secs();
         {
             let mut st = state.lock().unwrap();
@@ -1409,7 +1409,7 @@ mod tests {
     /// `auth_node` resolves a bearer token to its owning `AuthUser` and endpoint id.
     #[test]
     fn auth_node_resolves_token_to_owner() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         let tok = "aknk_".to_string() + &"ab".repeat(32); // 5 + 64 chars
         {
             let mut st = state.lock().unwrap();
@@ -1436,7 +1436,7 @@ mod tests {
     /// A token that matches no endpoint returns `None`.
     #[test]
     fn auth_node_bogus_token_returns_none() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         {
             let mut st = state.lock().unwrap();
             let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
@@ -1458,7 +1458,7 @@ mod tests {
     /// `GET /api/peermap` with a valid bearer token returns the user's other peers.
     #[test]
     fn peermap_via_token_header_returns_user_peers() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         let tok = "aknk_".to_string() + &"cc".repeat(32);
         {
             let mut st = state.lock().unwrap();
@@ -1500,7 +1500,7 @@ mod tests {
     /// and records the node's liveness.
     #[test]
     fn heartbeat_via_token_no_csrf_marks_liveness() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         let tok = "aknk_".to_string() + &"dd".repeat(32);
         {
             let mut st = state.lock().unwrap();
@@ -1531,7 +1531,7 @@ mod tests {
     /// is used as the heartbeat target.
     #[test]
     fn heartbeat_via_token_backfills_id_when_empty() {
-        let state = crate::state::new_shared();
+        let state = crate::state::new_test_shared();
         let tok = "aknk_".to_string() + &"ee".repeat(32);
         {
             let mut st = state.lock().unwrap();

@@ -1,0 +1,29 @@
+version: 1
+jobs:
+  - name: verify
+    executor: native
+    branches: [main]
+    run:
+      - RUSTUP_HOME=/home/olafurbui/.rustup CARGO_HOME=/home/olafurbui/.cargo PATH=/home/olafurbui/.cargo/bin:/usr/bin:/bin cargo fmt --all -- --check
+      - RUSTUP_HOME=/home/olafurbui/.rustup CARGO_HOME=/home/olafurbui/.cargo PATH=/home/olafurbui/.cargo/bin:/usr/bin:/bin cargo clippy --all-targets --all-features -- -D warnings
+      - RUSTUP_HOME=/home/olafurbui/.rustup CARGO_HOME=/home/olafurbui/.cargo PATH=/home/olafurbui/.cargo/bin:/usr/bin:/bin cargo test --all
+
+  - name: package
+    needs: [verify]
+    executor: native
+    branches: [main]
+    run: RUSTUP_HOME=/home/olafurbui/.rustup CARGO_HOME=/home/olafurbui/.cargo PATH=/home/olafurbui/.cargo/bin:/usr/bin:/bin cargo build --release --target x86_64-unknown-linux-musl -p akurai-node -p akurai-relay
+    artifacts:
+      - target/x86_64-unknown-linux-musl/release/akurai-node
+      - target/x86_64-unknown-linux-musl/release/akurai-relay
+
+  # Deploy restarts the EC2 VPN node + relay. Because the mesh is a dependency of
+  # EC2<->Titan reachability, this job is approval-gated and must be promoted
+  # deliberately (never auto) — a bad mesh deploy can sever the path CI uses.
+  - name: deploy
+    needs: [package]
+    executor: native
+    environment: production
+    approval: true
+    branches: [main]
+    run: HOME=/home/olafurbui RUSTUP_HOME=/home/olafurbui/.rustup CARGO_HOME=/home/olafurbui/.cargo PATH=/home/olafurbui/.local/bin:/home/olafurbui/.cargo/bin:/usr/bin:/bin ./deploy.sh ec2

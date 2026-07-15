@@ -4,6 +4,23 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 
 ## [Unreleased]
 
+### Fixed
+
+- Expire and retry pending handshakes instead of retaining a lost exchange forever.
+- Replace stale sessions on an authenticated fresh handshake after a peer restart.
+- Start reactive handshake recovery when data arrives without a usable session.
+- Route established data through the encrypted relay to survive changed ephemeral
+  endpoints without duplicate ciphertext triggering anti-replay rejection.
+- Isolate control-plane listener tests from persistent shared state, eliminating
+  order-dependent and repeated-suite failures.
+
+### Validation
+
+- Enforce clean formatting, workspace clippy with warnings denied, and full
+  workspace tests with warnings denied before release builds.
+- Verified unilateral Titan tunnel restart recovery and persistent NFSv4.2 traffic
+  between Titan (`100.88.0.9`), midget (`100.88.0.7`), and TV (`100.88.0.8`).
+
 ## [0.3.5] - 2026-07-01
 
 - Skip loopback direct endpoint candidates
@@ -170,4 +187,3 @@ All notable changes to this project are documented here. Format: Keep a Changelo
 - add deploy conduct comments
 - migrate to akurai-notes MCP; CLAUDE.md->@AGENTS.md; AGENTS.md->pointer
 - initial commit
-

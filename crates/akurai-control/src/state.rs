@@ -70,3 +70,15 @@ pub type SharedState = Arc<Mutex<AppState>>;
 pub fn new_shared() -> SharedState {
     Arc::new(Mutex::new(AppState::new()))
 }
+
+/// Create isolated in-memory state for tests. Tests must not load or mutate the
+/// process working directory's persistent endpoint registry.
+#[cfg(test)]
+pub fn new_test_shared() -> SharedState {
+    Arc::new(Mutex::new(AppState {
+        sessions: SessionStore::new(),
+        endpoints: Vec::new(),
+        pending_states: HashSet::new(),
+        heartbeats: HashMap::new(),
+    }))
+}
