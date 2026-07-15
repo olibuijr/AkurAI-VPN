@@ -213,8 +213,22 @@ pub fn serve() -> Result<(), String> {
 fn handle(stream: std::net::TcpStream, state: SharedState) {
     if let Some(req) = read_request(&stream) {
         let resp = route(&req, &state);
+        log_request(&req, &resp);
         let _ = (&stream).write_all(&resp.to_bytes());
     }
+}
+
+/// Log method, path, and status to stderr (captured by journald).
+///
+/// Logs only request metadata — no body, headers, or VPN key material.
+fn log_request(req: &Request, resp: &Response) {
+    let method = match req.method {
+        Method::Get => "GET",
+        Method::Post => "POST",
+        Method::Delete => "DELETE",
+    };
+    let code = resp.status.split(' ').next().unwrap_or("???");
+    eprintln!("{method} {} -> {code}", req.path);
 }
 
 fn read_request(stream: &std::net::TcpStream) -> Option<Request> {
