@@ -362,29 +362,11 @@ fn echo_peer_cmd(args: &[String]) -> Result<(), NodeError> {
         .unwrap_or_else(|| dirs.config.join("peers"));
     let peers = peers::PeerTable::load_file(&peers_path);
 
-    let overlay_cidr = format!(
-        "{}/{}",
-        akurai_common::OVERLAY_IPV4_NET,
-        akurai_common::OVERLAY_IPV4_PREFIX_LEN
-    );
-    // iface/mtu/advertise/exit_node/acl/control_url/cookie_jar/node_token are not
-    // used by echo_peer (no TUN, no control-plane refresh), but TunnelConfig is
-    // the canonical config carrier so we fill it fully.
-    let cfg = tunnel::TunnelConfig {
-        iface: "akurai0".to_string(),
+    let cfg = tunnel::EchoPeerConfig {
         overlay_ip,
-        overlay_cidr,
-        mtu: akurai_common::OVERLAY_MTU,
         relay,
         keypair: id.keypair,
         peers,
-        advertise: Vec::new(),
-        exit_node: None,
-        acl: None,
-        control_url: None,
-        cookie_jar: None,
-        node_token: None,
-        heartbeat: None,
     };
     tunnel::echo_peer(cfg, secs)?;
     Ok(())

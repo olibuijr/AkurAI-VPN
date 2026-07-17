@@ -89,6 +89,34 @@ pub struct TunnelConfig {
     /// so the advertised endpoint can carry the current direct UDP candidate.
     pub heartbeat: Option<HeartbeatConfig>,
 }
+/// Configuration for the userspace echo peer diagnostic. Unlike `TunnelConfig`,
+/// this path never opens a TUN device or uses control-plane/routing settings.
+pub struct EchoPeerConfig {
+    pub overlay_ip: Ipv4Addr,
+    pub relay: SocketAddr,
+    pub keypair: Keypair,
+    pub peers: PeerTable,
+}
+
+fn accept_handshake(
+    kp: &Keypair,
+    peers: &PeerTable,
+    my_ip: Ipv4Addr,
+    frame: &Frame,
+) -> Option<(Ipv4Addr, Session, Frame)> {
+    let eph = rand32().ok()?;
+    let (keys, msg2, init_pub) = noise::respond(kp, &eph, &frame.payload)?;
+    let peer = peers.get(&frame.src)?;
+    if peer.public_key != init_pub {
+        return None;
+    }
+    let response = Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)?;
+    Some((frame.src, Session::new(keys), response))
+}
+
+fn finish_handshake(state: Initiator, payload: &[u8]) -> Option<Session> {
+    noise::finalize(state, payload).map(Session::new)
+}
 
 /// Per-peer session + path state, shared between the pump threads.
 #[derive(Default)]
@@ -525,21 +553,22 @@ pub fn selftest(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
 ///
 /// No TUN device is opened — this is a pure-userspace overlay peer, so it
 /// compiles and runs on Linux, macOS, and Windows without any kernel privileges.
-pub fn echo_peer(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
+pub fn echo_peer(cfg: EchoPeerConfig, secs: u64) -> io::Result<()> {
+    let EchoPeerConfig {
+        overlay_ip: my_ip,
+        relay,
+        keypair: kp,
+        peers,
+    } = cfg;
     eprintln!(
         "akurai-node: echo-peer up — overlay {}, peer-echoing for {secs}s",
-        cfg.overlay_ip
+        my_ip
     );
 
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     // Short read timeout so the receive loop wakes up periodically to check the
     // deadline, even when no frames arrive.
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
-
-    let relay = cfg.relay;
-    let my_ip = cfg.overlay_ip;
-    let kp = cfg.keypair;
-    let peers = cfg.peers;
 
     // Keepalive thread: 5 s cadence (faster than the tunnel's 15 s) so the relay
     // records our UDP address quickly, before node A sends us a HandshakeInit.
@@ -585,33 +614,22 @@ pub fn echo_peer(cfg: TunnelConfig, secs: u64) -> io::Result<()> {
         let Some(frame) = Frame::decode(&buf[..n]) else {
             continue;
         };
-
         match frame.kind {
             FrameKind::HandshakeInit => {
-                // Mirror udp_pump: respond only when the initiator's recovered
-                // static key matches the configured peer.
-                let Ok(eph) = rand32() else { continue };
-                if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
-                    match peers.get(&frame.src) {
-                        Some(p) if p.public_key == init_pub => {
-                            sessions.insert(frame.src, Session::new(keys));
-                            if let Some(reply) =
-                                Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
-                            {
-                                // Send on the arrival path (same as udp_pump).
-                                let _ = sock.send_to(&reply.encode(), from);
-                            }
-                        }
-                        _ => {} // unknown peer or mismatched key: drop
-                    }
+                if let Some((peer_ip, session, reply)) =
+                    accept_handshake(&kp, &peers, my_ip, &frame)
+                {
+                    sessions.insert(peer_ip, session);
+                    // Respond on the arrival path, which may be direct or relay.
+                    let _ = sock.send_to(&reply.encode(), from);
                 }
             }
             FrameKind::HandshakeResp => {
                 // Complete any initiator we started (graceful, even though we
                 // normally do not initiate as echo-peer).
                 if let Some(state) = pending.remove(&frame.src) {
-                    if let Some(keys) = noise::finalize(state, &frame.payload) {
-                        sessions.insert(frame.src, Session::new(keys));
+                    if let Some(session) = finish_handshake(state, &frame.payload) {
+                        sessions.insert(frame.src, session);
                     }
                 }
             }
@@ -858,34 +876,24 @@ fn udp_pump(pump: Pump) {
                 }
             }
             FrameKind::HandshakeInit => {
-                let Ok(eph) = rand32() else { continue };
-                if let Some((keys, msg2, init_pub)) = noise::respond(&kp, &eph, &frame.payload) {
-                    match ptab.get(&frame.src) {
-                        Some(p) if p.public_key == init_pub => {
-                            {
-                                let mut t = table.lock().unwrap();
-                                let st = t.entry(frame.src).or_default();
-                                // The authenticated peer may have restarted and
-                                // lost its old session while we retained ours.
-                                st.session = Some(Session::new(keys));
-                                st.pending = None;
-                            }
-                            if let Some(reply) =
-                                Frame::new(FrameKind::HandshakeResp, my_ip, frame.src, msg2)
-                            {
-                                let _ = sock.send_to(&reply.encode(), from); // reply on arrival path
-                            }
-                        }
-                        _ => {} // unknown / mismatched peer: drop
-                    }
+                if let Some((peer_ip, session, reply)) = accept_handshake(&kp, &ptab, my_ip, &frame)
+                {
+                    let mut t = table.lock().unwrap();
+                    let st = t.entry(peer_ip).or_default();
+                    // The authenticated peer may have restarted and lost its
+                    // old session while we retained ours.
+                    st.session = Some(session);
+                    st.pending = None;
+                    drop(t);
+                    let _ = sock.send_to(&reply.encode(), from); // arrival path
                 }
             }
             FrameKind::HandshakeResp => {
                 let mut t = table.lock().unwrap();
                 let st = t.entry(frame.src).or_default();
                 if let Some((state, _)) = st.pending.take() {
-                    if let Some(keys) = noise::finalize(state, &frame.payload) {
-                        st.session = Some(Session::new(keys));
+                    if let Some(session) = finish_handshake(state, &frame.payload) {
+                        st.session = Some(session);
                     }
                 }
             }
