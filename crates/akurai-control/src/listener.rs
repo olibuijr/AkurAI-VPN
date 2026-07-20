@@ -535,6 +535,16 @@ fn tenant_required(user: &AuthUser) -> Result<(&str, &str), Response> {
     })
 }
 
+fn device_health_status(last_seen: u64, now: u64) -> &'static str {
+    if heartbeat::is_online(last_seen, now) {
+        "connected"
+    } else if last_seen > 0 {
+        "stale"
+    } else {
+        "degraded"
+    }
+}
+
 fn customer_health_json(
     endpoints: &[crate::vpn_endpoint::VpnEndpoint],
     heartbeats: &std::collections::HashMap<String, heartbeat::Heartbeat>,
@@ -547,13 +557,7 @@ fn customer_health_json(
         .filter(|e| e.is_active() && e.belongs_to(organization_id, workspace_id))
         .map(|e| {
             let last_seen = heartbeats.get(&e.id).map(|h| h.last_seen).unwrap_or(0);
-            let status = if heartbeat::is_online(last_seen, now) {
-                "connected"
-            } else if last_seen > 0 {
-                "stale"
-            } else {
-                "degraded"
-            };
+            let status = device_health_status(last_seen, now);
             format!(
                 "{{\"id\":\"{}\",\"name\":\"{}\",\"status\":\"{status}\",\"last_seen\":{last_seen},\"activated_at\":{}}}",
                 json_esc(&e.id),
@@ -564,6 +568,42 @@ fn customer_health_json(
         .collect::<Vec<_>>()
         .join(",");
     format!("[{devices}]\n")
+}
+
+fn customer_health_html(
+    endpoints: &[crate::vpn_endpoint::VpnEndpoint],
+    heartbeats: &std::collections::HashMap<String, heartbeat::Heartbeat>,
+    organization_id: &str,
+    workspace_id: &str,
+    now: u64,
+) -> String {
+    let devices = endpoints
+        .iter()
+        .filter(|e| e.is_active() && e.belongs_to(organization_id, workspace_id))
+        .map(|e| {
+            let last_seen = heartbeats.get(&e.id).map(|h| h.last_seen).unwrap_or(0);
+            let status = device_health_status(last_seen, now);
+            let last_seen = if last_seen == 0 {
+                "Never".to_string()
+            } else {
+                last_seen.to_string()
+            };
+            format!(
+                r#"<article class="device-card {status}">
+<header><h2>{}</h2><span class="status">{status}</span></header>
+<dl><div><dt>Last seen</dt><dd>{last_seen}</dd></div><div><dt>Activated</dt><dd>{}</dd></div></dl>
+</article>"#,
+                html_esc(&e.name),
+                e.added_at,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if devices.is_empty() {
+        r#"<p class="empty">No active devices.</p>"#.to_string()
+    } else {
+        format!(r#"<section class="device-list" aria-label="VPN devices">{devices}</section>"#)
+    }
 }
 
 fn json_esc(value: &str) -> String {
@@ -586,16 +626,14 @@ fn handle_dashboard(req: &Request, state: &SharedState) -> Response {
         Err(_) => return Response::error_html("Internal state lock error"),
     };
     let now = crate::vpn_endpoint::now_secs();
-    Response::ok_html(render_dashboard(
-        &session.user,
-        &customer_health_json(
-            &st.endpoints,
-            &st.heartbeats,
-            organization_id,
-            workspace_id,
-            now,
-        ),
-    ))
+    let health = customer_health_html(
+        &st.endpoints,
+        &st.heartbeats,
+        organization_id,
+        workspace_id,
+        now,
+    );
+    Response::ok_html(render_dashboard(&session.user, &health))
 }
 
 fn handle_list_endpoints(session: &AuthSession, state: &SharedState) -> Response {
@@ -1078,7 +1116,7 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 // HTML templates
 // ---------------------------------------------------------------------------
 
-fn render_dashboard(user: &AuthUser, health_json: &str) -> String {
+fn render_dashboard(user: &AuthUser, health_html: &str) -> String {
     let display = if user.name.is_empty() {
         html_esc(&user.email)
     } else {
@@ -1092,21 +1130,26 @@ fn render_dashboard(user: &AuthUser, health_json: &str) -> String {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AkurAI VPN — Device health</title>
 <style>
-:root{{--surface:#0f172a;--panel:#1e293b;--text:#e2e8f0;--muted:#94a3b8;--accent:#60a5fa}}
+:root{{--surface:#0f172a;--panel:#1e293b;--text:#e2e8f0;--muted:#94a3b8;--accent:#60a5fa;--connected:#4ade80;--stale:#fbbf24;--degraded:#f87171}}
 *{{box-sizing:border-box}}
 body{{font-family:system-ui,sans-serif;max-width:760px;margin:0 auto;padding:2rem;background:var(--surface);color:var(--text);line-height:1.5}}
 .bar{{display:flex;justify-content:space-between;align-items:center;background:var(--panel);padding:.875rem 1.25rem;border-radius:8px}}
-strong{{color:var(--text)}} p{{color:var(--muted)}} a{{color:var(--accent)}} pre{{overflow:auto;background:var(--panel);padding:1rem;border-radius:8px;color:var(--text)}}
+strong{{color:var(--text)}} p{{color:var(--muted)}} a{{color:var(--accent)}}
+.device-list{{display:grid;gap:.75rem}}
+.device-card{{padding:1rem 1.25rem;background:var(--panel);border-left:4px solid var(--muted);border-radius:8px}}
+.device-card.connected{{border-color:var(--connected)}} .device-card.stale{{border-color:var(--stale)}} .device-card.degraded{{border-color:var(--degraded)}}
+.device-card header{{display:flex;align-items:baseline;justify-content:space-between;gap:1rem}} h2{{margin:0;font-size:1rem}}
+.status{{color:var(--muted);font-size:.875rem;text-transform:capitalize}} .connected .status{{color:var(--connected)}} .stale .status{{color:var(--stale)}} .degraded .status{{color:var(--degraded)}}
+dl{{display:flex;gap:2rem;margin:.75rem 0 0}} dt{{color:var(--muted);font-size:.8rem}} dd{{margin:0;font-variant-numeric:tabular-nums}} .empty{{padding:1rem 1.25rem;background:var(--panel);border-radius:8px}}
 </style>
 </head>
 <body>
 <div class="bar"><span><strong>AkurAI VPN</strong> — Device health</span><span>{display}</span></div>
 <p>Connected, stale, and degraded device status. Network addresses, keys, tokens, and peer topology are never shown here.</p>
-<pre aria-label="VPN device health">{health}</pre>
+{health_html}
 <p><a href="/auth/logout">Sign out</a></p>
 </body>
 </html>"#,
-        health = html_esc(health_json),
     )
 }
 
