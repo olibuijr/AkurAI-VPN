@@ -697,10 +697,14 @@ fn handle_peermap(
     state: &SharedState,
     default_self_id: Option<&str>,
 ) -> Response {
-    let (organization_id, workspace_id) = match tenant_required(&session.user) {
-        Ok(scope) => scope,
-        Err(response) => return response,
-    };
+    // Node credentials are scoped to their owning endpoint's tenant boundary,
+    // which is empty for legacy pre-migration endpoints. Use that scope directly
+    // (as the token heartbeat path does) instead of requiring a non-empty tenant,
+    // so legacy nodes can still fetch their peers rather than 403ing the mesh
+    // down. `belongs_to` is exact-match, so the empty-scope legacy group stays
+    // isolated from tenant-scoped endpoints.
+    let organization_id = session.user.organization_id.as_str();
+    let workspace_id = session.user.workspace_id.as_str();
     let params = parse_query(&req.query);
     let self_id = params.get("self").map(String::as_str).or(default_self_id);
     let st = match state.lock() {
@@ -1635,6 +1639,55 @@ mod tests {
         assert!(
             !resp.body.contains("name-theirs"),
             "other tenant must not appear"
+        );
+    }
+
+    /// `GET /api/peermap` for a legacy pre-migration node (empty tenant scope)
+    /// must return its peers, not 403. Requiring a non-empty tenant here left
+    /// legacy nodes unable to learn peers and kept the mesh down even after
+    /// node auth was restored. The empty-scope group stays isolated from
+    /// tenant-scoped endpoints.
+    #[test]
+    fn peermap_legacy_empty_tenant_returns_peers_not_403() {
+        let state = crate::state::new_test_shared();
+        let tok = "aknk_".to_string() + &"ee".repeat(32);
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("mine", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            my_ep.organization_id.clear();
+            my_ep.workspace_id.clear();
+            st.endpoints.push(my_ep);
+            let mut peer_ep = ep("peer", "user@example.com", &["100.88.0.4/32"]);
+            peer_ep.organization_id.clear();
+            peer_ep.workspace_id.clear();
+            st.endpoints.push(peer_ep);
+            // A tenant-scoped endpoint must not leak into the legacy view.
+            st.endpoints
+                .push(ep("scoped", "other@example.com", &["100.88.0.5/32"]));
+        }
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            body: String::new(),
+        };
+        let resp = route(&req, &state);
+        assert_eq!(resp.status, "200 OK", "legacy node peermap must not 403");
+        assert!(
+            !resp.body.contains("name-mine"),
+            "peermap should exclude the requesting node"
+        );
+        assert!(
+            resp.body.contains("name-peer"),
+            "same legacy-scope peer should be present"
+        );
+        assert!(
+            !resp.body.contains("name-scoped"),
+            "tenant-scoped endpoint must not appear in the legacy view"
         );
     }
 
