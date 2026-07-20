@@ -155,11 +155,10 @@ mod tests {
             id: "id".to_string(),
             name: "n".to_string(),
             public_key: "pk".to_string(),
-            endpoint_addr: String::new(),
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
             added_by: "u@example.com".to_string(),
             added_at: 0,
-            node_token: String::new(),
+            ..Default::default()
         }
     }
 

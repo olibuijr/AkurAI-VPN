@@ -19,13 +19,16 @@ use std::io::{Read, Write};
 // ---------------------------------------------------------------------------
 
 /// Authenticated principal decoded from the OIDC id_token payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthUser {
     /// OIDC subject identifier (opaque, stable per user).
     pub sub: String,
     pub email: String,
     /// Display name from the `name` or `preferred_username` claim.
     pub name: String,
+    /// Opaque tenant claims required to scope VPN device access.
+    pub organization_id: String,
+    pub workspace_id: String,
 }
 
 /// A single persisted session record.
@@ -123,13 +126,16 @@ impl SessionStore {
             }
             lines.push(format!(
                 "{{\"token\":\"{}\",\"sub\":\"{}\",\"email\":\"{}\",\
-                 \"name\":\"{}\",\"csrf\":\"{}\",\"expires_at\":{}}}",
+                 \"name\":\"{}\",\"csrf\":\"{}\",\"expires_at\":{},\
+                 \"organization_id\":\"{}\",\"workspace_id\":\"{}\"}}",
                 session_json_esc(token),
                 session_json_esc(&rec.user.sub),
                 session_json_esc(&rec.user.email),
                 session_json_esc(&rec.user.name),
                 session_json_esc(&rec.csrf),
                 rec.expires_at,
+                session_json_esc(&rec.user.organization_id),
+                session_json_esc(&rec.user.workspace_id),
             ));
         }
         let json = format!("[\n{}\n]\n", lines.join(",\n"));
@@ -211,7 +217,14 @@ fn parse_sessions(json: &str) -> Vec<(String, SessionRecord)> {
             Some((
                 token,
                 SessionRecord {
-                    user: AuthUser { sub, email, name },
+                    user: AuthUser {
+                        sub,
+                        email,
+                        name,
+                        organization_id: extract_json_str(&obj, "organization_id")
+                            .unwrap_or_default(),
+                        workspace_id: extract_json_str(&obj, "workspace_id").unwrap_or_default(),
+                    },
                     csrf,
                     expires_at,
                 },
@@ -380,6 +393,10 @@ pub fn verify_introspect_response(
         name: extract_json_str(json, "name")
             .or_else(|| extract_json_str(json, "preferred_username"))
             .unwrap_or_default(),
+        organization_id: extract_json_str(json, "organization_id")
+            .or_else(|| extract_json_str(json, "org_id"))
+            .unwrap_or_default(),
+        workspace_id: extract_json_str(json, "workspace_id").unwrap_or_default(),
     })
 }
 
@@ -398,6 +415,10 @@ pub fn decode_jwt_claims(id_token: &str) -> Option<AuthUser> {
         name: extract_json_str(&payload, "name")
             .or_else(|| extract_json_str(&payload, "preferred_username"))
             .unwrap_or_default(),
+        organization_id: extract_json_str(&payload, "organization_id")
+            .or_else(|| extract_json_str(&payload, "org_id"))
+            .unwrap_or_default(),
+        workspace_id: extract_json_str(&payload, "workspace_id").unwrap_or_default(),
     })
 }
 
@@ -715,6 +736,7 @@ mod tests {
             sub: "sub-1".to_string(),
             email: "a@example.com".to_string(),
             name: "Alice".to_string(),
+            ..Default::default()
         };
         // Use a large TTL so the record does not expire during the test.
         store.sessions.insert(
@@ -739,6 +761,7 @@ mod tests {
             sub: "sub-2".to_string(),
             email: "b@example.com".to_string(),
             name: "Bob".to_string(),
+            ..Default::default()
         };
         // expires_at = 1 is safely in the past.
         store.sessions.insert(
@@ -773,6 +796,7 @@ mod tests {
             sub: "u-persist".to_string(),
             email: "p@example.com".to_string(),
             name: "Persist".to_string(),
+            ..Default::default()
         };
         store.insert("tok-persist".to_string(), user, "csrf-p".to_string(), 3600);
 
