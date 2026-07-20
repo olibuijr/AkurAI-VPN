@@ -1000,13 +1000,10 @@ fn node_token_from_req(req: &Request) -> Option<String> {
 fn auth_node(req: &Request, state: &SharedState) -> Option<(AuthUser, String)> {
     let token = node_token_from_req(req)?;
     let st = state.lock().ok()?;
-    let ep = st.endpoints.iter().find(|e| {
-        e.is_active()
-            && !e.organization_id.is_empty()
-            && !e.workspace_id.is_empty()
-            && !e.node_token.is_empty()
-            && e.node_token == token
-    })?;
+    let ep = st
+        .endpoints
+        .iter()
+        .find(|e| e.is_active() && !e.node_token.is_empty() && e.node_token == token)?;
     let user = auth::AuthUser {
         sub: ep.added_by.clone(),
         email: ep.added_by.clone(),
@@ -1523,6 +1520,38 @@ mod tests {
             body: String::new(),
         };
         assert!(auth_node(&req, &state).is_none());
+    }
+
+    /// A pre-migration endpoint with no organization_id/workspace_id (never
+    /// backfilled) must still authenticate via its node_token — losing this
+    /// would lock every already-enrolled device out after a tenant-scope
+    /// migration, with no way to re-enroll since enrollment requires an
+    /// authenticated OIDC session that itself may depend on the peer mesh.
+    #[test]
+    fn auth_node_accepts_legacy_endpoint_with_empty_tenant_scope() {
+        let state = crate::state::new_test_shared();
+        let tok = "aknk_".to_string() + &"cc".repeat(32);
+        {
+            let mut st = state.lock().unwrap();
+            let mut my_ep = ep("legacy", "user@example.com", &["100.88.0.2/32"]);
+            my_ep.node_token = tok.clone();
+            my_ep.organization_id.clear();
+            my_ep.workspace_id.clear();
+            st.endpoints.push(my_ep);
+        }
+        let req = Request {
+            method: Method::Get,
+            path: "/api/peermap".to_string(),
+            query: String::new(),
+            headers: [("authorization".to_string(), format!("Bearer {tok}"))]
+                .into_iter()
+                .collect(),
+            body: String::new(),
+        };
+        let result = auth_node(&req, &state);
+        assert!(result.is_some(), "legacy endpoint must still authenticate");
+        let (_user, ep_id) = result.unwrap();
+        assert_eq!(ep_id, "legacy");
     }
 
     /// `GET /api/peermap` with a valid bearer token returns the user's other peers.
