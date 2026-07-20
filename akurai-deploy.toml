@@ -1,6 +1,6 @@
 # akurai-deploy.toml — declarative release/deploy config for `akurai-ec2 release`.
 # Replaces the imperative logic that used to live in deploy.sh. The release engine
-# reads this; `./deploy.sh` is now a thin shim into it.
+# reads this; `akurai-ec2 release` is the maintained entrypoint.
 
 name          = "akurai-vpn-control"          # systemd unit on the box
 domain        = "vpn.olibuijr.com"            # nginx vhost ("-" = internal/no public domain)
