@@ -326,15 +326,25 @@ fn route(req: &Request, state: &SharedState) -> Response {
             }
         }
         (Method::Get, "/api/peermap") => {
-            if let Some(session) = require_auth(req, state) {
-                handle_peermap(req, &session, state, None)
-            } else if let Some((user, ep_id)) = auth_node(req, state) {
-                // Token-auth: build a synthetic AuthSession (csrf_token unused for peermap).
+            if let Some((user, ep_id)) = auth_node(req, state) {
+                // Only a device credential may retrieve mesh topology.
                 let session = AuthSession {
                     user,
                     csrf_token: String::new(),
                 };
                 handle_peermap(req, &session, state, Some(&ep_id))
+            } else {
+                Response {
+                    status: "401 Unauthorized",
+                    content_type: "application/json",
+                    extra: vec![],
+                    body: r#"{"error":"unauthorized"}"#.to_string(),
+                }
+            }
+        }
+        (Method::Get, "/api/vpn/health") => {
+            if let Some(session) = require_auth(req, state) {
+                handle_customer_health(&session, state)
             } else {
                 Response {
                     status: "401 Unauthorized",
@@ -359,6 +369,12 @@ fn route(req: &Request, state: &SharedState) -> Response {
                     body: r#"{"error":"unauthorized"}"#.to_string(),
                 }
             }
+        }
+        (Method::Post, "/api/devices/bootstrap") => {
+            let Some(session) = require_auth(req, state) else {
+                return Response::redirect("/login");
+            };
+            bootstrap_device_token(req, &session, state)
         }
         (Method::Post, "/api/endpoints") => {
             let Some(user) = require_auth(req, state) else {
@@ -505,38 +521,132 @@ fn handle_logout(req: &Request, state: &SharedState) -> Response {
     }
 }
 
+fn tenant_scope(user: &AuthUser) -> Option<(&str, &str)> {
+    (!user.organization_id.is_empty() && !user.workspace_id.is_empty())
+        .then_some((user.organization_id.as_str(), user.workspace_id.as_str()))
+}
+
+fn tenant_required(user: &AuthUser) -> Result<(&str, &str), Response> {
+    tenant_scope(user).ok_or_else(|| Response {
+        status: "403 Forbidden",
+        content_type: "application/json",
+        extra: vec![],
+        body: r#"{"error":"organization and workspace context required"}"#.to_string(),
+    })
+}
+
+fn customer_health_json(
+    endpoints: &[crate::vpn_endpoint::VpnEndpoint],
+    heartbeats: &std::collections::HashMap<String, heartbeat::Heartbeat>,
+    organization_id: &str,
+    workspace_id: &str,
+    now: u64,
+) -> String {
+    let devices = endpoints
+        .iter()
+        .filter(|e| e.is_active() && e.belongs_to(organization_id, workspace_id))
+        .map(|e| {
+            let last_seen = heartbeats.get(&e.id).map(|h| h.last_seen).unwrap_or(0);
+            let status = if heartbeat::is_online(last_seen, now) {
+                "connected"
+            } else if last_seen > 0 {
+                "stale"
+            } else {
+                "degraded"
+            };
+            format!(
+                "{{\"id\":\"{}\",\"name\":\"{}\",\"status\":\"{status}\",\"last_seen\":{last_seen},\"activated_at\":{}}}",
+                json_esc(&e.id),
+                json_esc(&e.name),
+                e.added_at,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{devices}]\n")
+}
+
+fn json_esc(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 fn handle_dashboard(req: &Request, state: &SharedState) -> Response {
-    let Some(user) = require_auth(req, state) else {
+    let Some(session) = require_auth(req, state) else {
         return Response::redirect("/login");
     };
-    let endpoints = state
-        .lock()
-        .ok()
-        .map(|s| {
-            s.endpoints
-                .iter()
-                .filter(|e| e.added_by == user.user.email)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Response::ok_html(render_dashboard(&user.user, &user.csrf_token, &endpoints))
+    let Ok((organization_id, workspace_id)) = tenant_required(&session.user) else {
+        return Response::redirect("/login");
+    };
+    let st = match state.lock() {
+        Ok(st) => st,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    let now = crate::vpn_endpoint::now_secs();
+    Response::ok_html(render_dashboard(
+        &session.user,
+        &customer_health_json(
+            &st.endpoints,
+            &st.heartbeats,
+            organization_id,
+            workspace_id,
+            now,
+        ),
+    ))
 }
 
 fn handle_list_endpoints(session: &AuthSession, state: &SharedState) -> Response {
-    let json = state
-        .lock()
-        .ok()
-        .map(|s| {
-            s.endpoints
-                .iter()
-                .filter(|e| e.added_by == session.user.email)
-                .map(|e| e.to_json())
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    Response::ok_json(format!("[{json}]\n"))
+    handle_customer_health(session, state)
+}
+
+fn handle_customer_health(session: &AuthSession, state: &SharedState) -> Response {
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let st = match state.lock() {
+        Ok(st) => st,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    Response::ok_json(customer_health_json(
+        &st.endpoints,
+        &st.heartbeats,
+        organization_id,
+        workspace_id,
+        crate::vpn_endpoint::now_secs(),
+    ))
+}
+
+fn bootstrap_device_token(req: &Request, session: &AuthSession, state: &SharedState) -> Response {
+    if !csrf_valid(req, session) {
+        return Response::bad_request("invalid csrf token");
+    }
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let public_key = auth::extract_json_str(&req.body, "public_key").unwrap_or_default();
+    if public_key.is_empty() {
+        return Response::bad_request("public_key is required");
+    }
+    let st = match state.lock() {
+        Ok(st) => st,
+        Err(_) => return Response::error_html("Internal state lock error"),
+    };
+    let Some(device) = st.endpoints.iter().find(|e| {
+        e.is_active() && e.belongs_to(organization_id, workspace_id) && e.public_key == public_key
+    }) else {
+        return Response::not_found();
+    };
+    // Deliberately only credential handoff: no address, peer, or key topology.
+    Response::ok_json(format!(
+        "{{\"id\":\"{}\",\"node_token\":\"{}\"}}\n",
+        json_esc(&device.id),
+        json_esc(&device.node_token),
+    ))
 }
 
 /// `GET /api/peermap` — the caller's peers (their own nodes minus the requesting
@@ -549,6 +659,10 @@ fn handle_peermap(
     state: &SharedState,
     default_self_id: Option<&str>,
 ) -> Response {
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
     let params = parse_query(&req.query);
     let self_id = params.get("self").map(String::as_str).or(default_self_id);
     let st = match state.lock() {
@@ -559,7 +673,8 @@ fn handle_peermap(
     let json = peermap::build_peermap_json(
         &st.endpoints,
         &st.heartbeats,
-        &session.user.email,
+        organization_id,
+        workspace_id,
         self_id,
         now,
     );
@@ -586,10 +701,14 @@ fn handle_heartbeat(req: &Request, session: &AuthSession, state: &SharedState) -
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
     };
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
     let owned = st
         .endpoints
         .iter()
-        .any(|e| e.id == id && e.added_by == session.user.email);
+        .any(|e| e.id == id && e.is_active() && e.belongs_to(organization_id, workspace_id));
     if !owned {
         return Response::not_found();
     }
@@ -676,9 +795,23 @@ fn do_add_endpoint(
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
     };
+    let (organization_id, workspace_id) = match tenant_required(user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
 
     // Assign a stable, unique overlay IPv4 from 100.88.0.0/16. Done under the
     // state lock so concurrent enrollments cannot race onto the same index.
+    if let Some(existing) = st.endpoints.iter().find(|e| {
+        e.is_active() && e.belongs_to(organization_id, workspace_id) && e.public_key == public_key
+    }) {
+        let overlay_ipv4 =
+            crate::ipam::overlay_addr_string(&existing.allowed_ips).unwrap_or_default();
+        return Response::ok_json(format!(
+            "{{\"ok\":true,\"id\":\"{}\",\"overlay_ipv4\":\"{}\"}}\n",
+            existing.id, overlay_ipv4
+        ));
+    }
     // Normalize to exactly ONE overlay address per node: strip every overlay
     // entry the caller supplied (so no stray index can be smuggled in), then
     // re-insert a single canonical /32 — the supplied index if it is a valid,
@@ -707,6 +840,10 @@ fn do_add_endpoint(
         allowed_ips,
         added_by: user.email.clone(),
         added_at: now_secs(),
+        organization_id: organization_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        revoked_at: 0,
+        token_rotated_at: 0,
         node_token: crate::vpn_endpoint::generate_node_token(),
     };
     let id = ep.id.clone();
@@ -745,16 +882,29 @@ fn delete_endpoint(
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
     };
-    let before = st.endpoints.len();
-    st.endpoints
-        .retain(|e| !(e.id == id && e.added_by == session.user.email));
-    if st.endpoints.len() == before {
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let Some(device) = st
+        .endpoints
+        .iter_mut()
+        .find(|e| e.id == id && e.is_active() && e.belongs_to(organization_id, workspace_id))
+    else {
         return Response::not_found();
-    }
+    };
+    device.revoked_at = crate::vpn_endpoint::now_secs();
+    st.heartbeats.remove(id);
     if let Err(e) = crate::vpn_endpoint::save(&st.endpoints) {
-        eprintln!("{NAME}: failed to persist endpoints after delete: {e}");
+        eprintln!("{NAME}: failed to persist endpoint revocation: {e}");
+        return Response {
+            status: "500 Internal Server Error",
+            content_type: "application/json",
+            extra: vec![],
+            body: "{\"ok\":false,\"error\":\"failed to persist revocation\"}\n".to_string(),
+        };
     }
-    Response::redirect("/dashboard")
+    Response::ok_json("{\"ok\":true,\"status\":\"revoked\"}\n".to_string())
 }
 
 /// Rotate (revoke + reissue) the durable node token for one of the caller's own
@@ -768,18 +918,29 @@ fn rotate_token(id: &str, session: &AuthSession, req: &Request, state: &SharedSt
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
     };
+    let (organization_id, workspace_id) = match tenant_required(&session.user) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
     let Some(ep) = st
         .endpoints
         .iter_mut()
-        .find(|e| e.id == id && e.added_by == session.user.email)
+        .find(|e| e.id == id && e.is_active() && e.belongs_to(organization_id, workspace_id))
     else {
         return Response::not_found();
     };
     ep.node_token = crate::vpn_endpoint::generate_node_token();
+    ep.token_rotated_at = crate::vpn_endpoint::now_secs();
     if let Err(e) = crate::vpn_endpoint::save(&st.endpoints) {
-        eprintln!("{NAME}: failed to persist endpoints after token rotation: {e}");
+        eprintln!("{NAME}: failed to persist endpoint token rotation: {e}");
+        return Response {
+            status: "500 Internal Server Error",
+            content_type: "application/json",
+            extra: vec![],
+            body: "{\"ok\":false,\"error\":\"failed to persist token rotation\"}\n".to_string(),
+        };
     }
-    Response::redirect("/dashboard")
+    Response::ok_json("{\"ok\":true,\"status\":\"rotated\"}\n".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -839,14 +1000,19 @@ fn node_token_from_req(req: &Request) -> Option<String> {
 fn auth_node(req: &Request, state: &SharedState) -> Option<(AuthUser, String)> {
     let token = node_token_from_req(req)?;
     let st = state.lock().ok()?;
-    let ep = st
-        .endpoints
-        .iter()
-        .find(|e| !e.node_token.is_empty() && e.node_token == token)?;
+    let ep = st.endpoints.iter().find(|e| {
+        e.is_active()
+            && !e.organization_id.is_empty()
+            && !e.workspace_id.is_empty()
+            && !e.node_token.is_empty()
+            && e.node_token == token
+    })?;
     let user = auth::AuthUser {
         sub: ep.added_by.clone(),
         email: ep.added_by.clone(),
         name: String::new(),
+        organization_id: ep.organization_id.clone(),
+        workspace_id: ep.workspace_id.clone(),
     };
     Some((user, ep.id.clone()))
 }
@@ -864,14 +1030,14 @@ fn handle_heartbeat_token(
     token_ep_id: &str,
     state: &SharedState,
 ) -> Response {
-    // Back-fill id from the token's own endpoint when the caller omits it.
-    let id = {
-        let body_id = auth::extract_json_str(&req.body, "id").unwrap_or_default();
-        if body_id.is_empty() {
-            token_ep_id.to_string()
-        } else {
-            body_id
-        }
+    let body_id = auth::extract_json_str(&req.body, "id").unwrap_or_default();
+    if !body_id.is_empty() && body_id != token_ep_id {
+        return Response::not_found();
+    }
+    let id = if body_id.is_empty() {
+        token_ep_id.to_string()
+    } else {
+        body_id
     };
     if id.is_empty() {
         return Response::bad_request("id is required");
@@ -882,11 +1048,9 @@ fn handle_heartbeat_token(
         Ok(s) => s,
         Err(_) => return Response::error_html("Internal state lock error"),
     };
-    // Ownership check: the resolved email must own the heartbeated node.
-    let owned = st
-        .endpoints
-        .iter()
-        .any(|e| e.id == id && e.added_by == user.email);
+    let owned = st.endpoints.iter().any(|e| {
+        e.id == id && e.is_active() && e.belongs_to(&user.organization_id, &user.workspace_id)
+    });
     if !owned {
         return Response::not_found();
     }
@@ -917,160 +1081,35 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 // HTML templates
 // ---------------------------------------------------------------------------
 
-fn render_dashboard(
-    user: &AuthUser,
-    csrf_token: &str,
-    endpoints: &[crate::vpn_endpoint::VpnEndpoint],
-) -> String {
-    let table = if endpoints.is_empty() {
-        r#"<p class="empty">No VPN endpoints registered yet. Add one below.</p>"#.to_string()
+fn render_dashboard(user: &AuthUser, health_json: &str) -> String {
+    let display = if user.name.is_empty() {
+        html_esc(&user.email)
     } else {
-        let rows: String = endpoints
-            .iter()
-            .map(|e| {
-                let pk_short = if e.public_key.len() > 24 {
-                    format!("{}…", &e.public_key[..24])
-                } else {
-                    e.public_key.clone()
-                };
-                let token_short = if e.node_token.len() > 14 {
-                    format!("{}…", &e.node_token[..14])
-                } else if e.node_token.is_empty() {
-                    "—".to_string()
-                } else {
-                    e.node_token.clone()
-                };
-                let ips = e.allowed_ips.join(", ");
-                let ep_disp = if e.endpoint_addr.is_empty() {
-                    "—".to_string()
-                } else {
-                    e.endpoint_addr.clone()
-                };
-                let overlay = crate::ipam::overlay_addr_string(&e.allowed_ips)
-                    .unwrap_or_else(|| "—".to_string());
-                format!(
-                    "<tr>\
-                     <td>{name}</td>\
-                     <td class=\"code\" title=\"{pk_full}\">{pk_short}</td>\
-                     <td>{ep}</td>\
-                     <td class=\"code\">Overlay IP: {overlay}</td>\
-                     <td>{ips}</td>\
-                     <td>{by}</td>\
-                     <td class=\"code\" title=\"{token_full}\">{token_short}</td>\
-                     <td>\
-                       <form method=\"POST\" action=\"/api/endpoints/{id}/rotate-token\" style=\"margin:0 0 4px 0\">\
-                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                         <button type=\"submit\" class=\"btn\">Rotate token</button>\
-                       </form>\
-                       <form method=\"POST\" action=\"/api/endpoints/{id}/delete\" style=\"margin:0\">\
-                         <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\">\
-                         <button type=\"submit\" class=\"btn btn-danger\">Delete</button>\
-                       </form>\
-                     </td>\
-                     </tr>",
-                    name = html_esc(&e.name),
-                    pk_full = html_esc(&e.public_key),
-                    pk_short = html_esc(&pk_short),
-                    ep = html_esc(&ep_disp),
-                    overlay = html_esc(&overlay),
-                    ips = html_esc(&ips),
-                    by = html_esc(&e.added_by),
-                    token_full = html_esc(&e.node_token),
-                    token_short = html_esc(&token_short),
-                    id = html_esc(&e.id),
-                    csrf = html_esc(csrf_token),
-                )
-            })
-            .collect();
-        format!(
-            "<table>\
-             <thead><tr>\
-               <th>Name</th><th>Public Key</th><th>Endpoint</th>\
-               <th>Overlay IP</th><th>Allowed IPs</th><th>Added By</th><th>Node Token</th><th></th>\
-             </tr></thead>\
-             <tbody>{rows}</tbody>\
-             </table>"
-        )
+        html_esc(&user.name)
     };
-
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AkurAI VPN — Dashboard</title>
+<title>AkurAI VPN — Device health</title>
 <style>
+:root{{--surface:#0f172a;--panel:#1e293b;--text:#e2e8f0;--muted:#94a3b8;--accent:#60a5fa}}
 *{{box-sizing:border-box}}
-body{{font-family:system-ui,sans-serif;max-width:960px;margin:0 auto;padding:2rem;background:#0f172a;color:#e2e8f0;line-height:1.5}}
-h2{{color:#60a5fa;margin-top:2rem;font-size:1.1rem}}
-.bar{{display:flex;justify-content:space-between;align-items:center;background:#1e293b;padding:.875rem 1.25rem;border-radius:8px;margin-bottom:2rem;font-size:.9rem}}
-.bar strong{{color:#e2e8f0}}
-table{{width:100%;border-collapse:collapse}}
-th,td{{text-align:left;padding:.5rem .75rem;border-bottom:1px solid #1e293b;font-size:.85rem}}
-th{{background:#1e293b;color:#94a3b8;font-weight:500}}
-tr:hover td{{background:#1e293b55}}
-.btn{{display:inline-block;padding:.375rem .875rem;border:none;border-radius:5px;cursor:pointer;font-size:.8125rem;text-decoration:none;font-family:inherit}}
-.btn-primary{{background:#3b82f6;color:#fff}}
-.btn-primary:hover{{background:#2563eb}}
-.btn-danger{{background:#ef4444;color:#fff}}
-.btn-danger:hover{{background:#dc2626}}
-.btn-ghost{{background:#334155;color:#e2e8f0}}
-.btn-ghost:hover{{background:#475569}}
-form.add-form{{background:#1e293b;padding:1.5rem;border-radius:8px;margin-top:1rem}}
-.field{{margin-bottom:1rem}}
-label{{display:block;color:#94a3b8;font-size:.8125rem;margin-bottom:.3rem}}
-input{{width:100%;padding:.5rem .75rem;background:#0f172a;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-size:.875rem}}
-input:focus{{outline:none;border-color:#3b82f6}}
-.code{{font-family:monospace;font-size:.75rem;word-break:break-all}}
-.empty{{color:#64748b;padding:2rem 0;font-size:.9rem}}
+body{{font-family:system-ui,sans-serif;max-width:760px;margin:0 auto;padding:2rem;background:var(--surface);color:var(--text);line-height:1.5}}
+.bar{{display:flex;justify-content:space-between;align-items:center;background:var(--panel);padding:.875rem 1.25rem;border-radius:8px}}
+strong{{color:var(--text)}} p{{color:var(--muted)}} a{{color:var(--accent)}} pre{{overflow:auto;background:var(--panel);padding:1rem;border-radius:8px;color:var(--text)}}
 </style>
 </head>
 <body>
-<div class="bar">
-  <span><strong>AkurAI VPN</strong> &mdash; Control Dashboard</span>
-  <span>Signed in as <strong>{display}</strong>&nbsp;
-    <a href="/auth/logout" class="btn btn-ghost">Sign out</a>
-  </span>
-</div>
-
-<h2>VPN Endpoints</h2>
-{table}
-
-<h2>Add Endpoint</h2>
-<form method="POST" action="/api/endpoints/add" class="add-form">
-  <input type="hidden" name="csrf_token" value="{csrf_token}">
-  <div class="field">
-    <label for="f-name">Name</label>
-    <input id="f-name" name="name" type="text" placeholder="home-server" required>
-  </div>
-  <div class="field">
-    <label for="f-pk">Public Key (WireGuard base64)</label>
-    <input id="f-pk" name="public_key" type="text" placeholder="base64-encoded 32-byte public key" required>
-  </div>
-  <div class="field">
-    <label for="f-ep">Endpoint Address <small style="color:#64748b">(optional)</small></label>
-    <input id="f-ep" name="endpoint" type="text" placeholder="203.0.113.1:51820">
-  </div>
-  <div class="field">
-    <label for="f-ips">Allowed IPs <small style="color:#64748b">(comma-separated)</small></label>
-    <input id="f-ips" name="allowed_ips" type="text" placeholder="100.88.0.2/32, 0.0.0.0/0">
-  </div>
-  <button type="submit" class="btn btn-primary">Add Endpoint</button>
-</form>
+<div class="bar"><span><strong>AkurAI VPN</strong> — Device health</span><span>{display}</span></div>
+<p>Connected, stale, and degraded device status. Network addresses, keys, tokens, and peer topology are never shown here.</p>
+<pre aria-label="VPN device health">{health}</pre>
+<p><a href="/auth/logout">Sign out</a></p>
 </body>
 </html>"#,
-        display = {
-            let n = html_esc(&user.name);
-            let e = html_esc(&user.email);
-            if n.is_empty() {
-                e
-            } else {
-                format!("{n} &lt;{e}&gt;")
-            }
-        },
-        table = table,
-        csrf_token = html_esc(csrf_token),
+        health = html_esc(health_json),
     )
 }
 
@@ -1133,36 +1172,34 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_forms_include_csrf_token() {
+    fn dashboard_renders_customer_safe_status_from_the_embedded_summary() {
         let user = AuthUser {
             sub: "sub".to_string(),
             email: "user@example.com".to_string(),
             name: "User".to_string(),
+            ..Default::default()
         };
-        let html = render_dashboard(&user, "csrf-value", &[]);
-        assert!(html.contains(r#"name="csrf_token" value="csrf-value""#));
+        let health_json = r#"[{"id":"n1","name":"midget","status":"connected","last_seen":1000,"activated_at":1}]"#;
+        let html = render_dashboard(&user, health_json);
+        assert!(html.contains("connected"));
+        assert!(html.contains("midget"));
     }
 
     #[test]
-    fn dashboard_surfaces_overlay_ip() {
+    fn dashboard_never_leaks_network_addresses_or_peer_topology() {
         let user = AuthUser {
             sub: "sub".to_string(),
             email: "user@example.com".to_string(),
             name: "User".to_string(),
+            ..Default::default()
         };
-        let ep = crate::vpn_endpoint::VpnEndpoint {
-            id: "n1".to_string(),
-            name: "midget".to_string(),
-            public_key: "pk".to_string(),
-            endpoint_addr: String::new(),
-            allowed_ips: vec!["100.88.0.2/32".to_string()],
-            added_by: "user@example.com".to_string(),
-            added_at: 1,
-            node_token: String::new(),
-        };
-        let html = render_dashboard(&user, "csrf", std::slice::from_ref(&ep));
-        assert!(html.contains("Overlay IP: 100.88.0.2"));
-        assert!(html.contains("<th>Overlay IP</th>"));
+        // Even if a caller somehow passed raw endpoint data through, the
+        // dashboard template itself must not have any overlay-IP/peer/key
+        // rendering path — it only ever echoes the pre-scrubbed health JSON.
+        let html = render_dashboard(&user, "[]");
+        assert!(!html.contains("Overlay IP"));
+        assert!(!html.contains("public_key"));
+        assert!(!html.contains("allowed_ips"));
     }
 
     #[test]
@@ -1174,21 +1211,21 @@ mod tests {
                 id: "mine".to_string(),
                 name: "midget".to_string(),
                 public_key: "pk1".to_string(),
-                endpoint_addr: String::new(),
-                allowed_ips: Vec::new(),
                 added_by: "user@example.com".to_string(),
                 added_at: 1,
-                node_token: String::new(),
+                organization_id: "org-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+                ..Default::default()
             });
             st.endpoints.push(crate::vpn_endpoint::VpnEndpoint {
                 id: "other".to_string(),
                 name: "other-host".to_string(),
                 public_key: "pk2".to_string(),
-                endpoint_addr: String::new(),
-                allowed_ips: Vec::new(),
                 added_by: "other@example.com".to_string(),
                 added_at: 1,
-                node_token: String::new(),
+                organization_id: "org-2".to_string(),
+                workspace_id: "ws-2".to_string(),
+                ..Default::default()
             });
         }
         let session = AuthSession {
@@ -1196,6 +1233,8 @@ mod tests {
                 sub: "sub".to_string(),
                 email: "user@example.com".to_string(),
                 name: "User".to_string(),
+                organization_id: "org-1".to_string(),
+                workspace_id: "ws-1".to_string(),
             },
             csrf_token: "csrf".to_string(),
         };
@@ -1213,11 +1252,11 @@ mod tests {
                 id: "other".to_string(),
                 name: "other-host".to_string(),
                 public_key: "pk2".to_string(),
-                endpoint_addr: String::new(),
-                allowed_ips: Vec::new(),
                 added_by: "other@example.com".to_string(),
                 added_at: 1,
-                node_token: String::new(),
+                organization_id: "org-2".to_string(),
+                workspace_id: "ws-2".to_string(),
+                ..Default::default()
             });
         }
         let session = AuthSession {
@@ -1225,6 +1264,8 @@ mod tests {
                 sub: "sub".to_string(),
                 email: "user@example.com".to_string(),
                 name: "User".to_string(),
+                organization_id: "org-1".to_string(),
+                workspace_id: "ws-1".to_string(),
             },
             csrf_token: "csrf".to_string(),
         };
@@ -1250,7 +1291,7 @@ mod tests {
 
         // Owner can rotate: token changes to a fresh aknk_ value.
         let resp = rotate_token("mine", &session, &req, &state);
-        assert_eq!(resp.status, "302 Found");
+        assert_eq!(resp.status, "200 OK");
         let new_tok = state
             .lock()
             .unwrap()
@@ -1270,27 +1311,42 @@ mod tests {
 
     // -- peer map + heartbeat ------------------------------------------------
 
+    /// Deterministic tenant scope for the two fixed test identities used
+    /// throughout this module.
+    fn tenant_for(email: &str) -> (&'static str, &'static str) {
+        if email == "user@example.com" {
+            ("org-1", "ws-1")
+        } else {
+            ("org-2", "ws-2")
+        }
+    }
+
     fn session_for(email: &str) -> AuthSession {
+        let (org_id, ws_id) = tenant_for(email);
         AuthSession {
             user: AuthUser {
                 sub: "sub".to_string(),
                 email: email.to_string(),
                 name: "User".to_string(),
+                organization_id: org_id.to_string(),
+                workspace_id: ws_id.to_string(),
             },
             csrf_token: "csrf".to_string(),
         }
     }
 
     fn ep(id: &str, added_by: &str, allowed: &[&str]) -> crate::vpn_endpoint::VpnEndpoint {
+        let (org_id, ws_id) = tenant_for(added_by);
         crate::vpn_endpoint::VpnEndpoint {
             id: id.to_string(),
             name: format!("name-{id}"),
             public_key: format!("pk-{id}"),
-            endpoint_addr: String::new(),
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
             added_by: added_by.to_string(),
             added_at: 1,
-            node_token: String::new(),
+            organization_id: org_id.to_string(),
+            workspace_id: ws_id.to_string(),
+            ..Default::default()
         }
     }
 

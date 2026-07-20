@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A registered VPN endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VpnEndpoint {
     pub id: String,
     pub name: String,
@@ -20,6 +20,13 @@ pub struct VpnEndpoint {
     pub allowed_ips: Vec<String>,
     pub added_by: String,
     pub added_at: u64,
+    /// Tenant boundary established by the authenticated enrollment context.
+    pub organization_id: String,
+    pub workspace_id: String,
+    /// Zero while active; a non-zero timestamp revokes all node-token access.
+    pub revoked_at: u64,
+    /// Last durable node-token rotation, or zero if the original token remains.
+    pub token_rotated_at: u64,
     /// Durable node authentication token (prefix `aknk_` + 64 hex chars).
     /// Generated at registration time and persisted alongside the endpoint
     /// record. Nodes present this in `Authorization: Bearer` or `X-Node-Token`
@@ -29,8 +36,18 @@ pub struct VpnEndpoint {
 }
 
 impl VpnEndpoint {
-    /// Serialize to a JSON object string (no serde dependency).
-    pub fn to_json(&self) -> String {
+    /// Whether this device may authenticate or appear in a peer map.
+    pub fn is_active(&self) -> bool {
+        self.revoked_at == 0
+    }
+
+    /// Match a concrete organization/workspace tenant boundary.
+    pub fn belongs_to(&self, organization_id: &str, workspace_id: &str) -> bool {
+        self.organization_id == organization_id && self.workspace_id == workspace_id
+    }
+
+    /// Serialize the durable operator-only record (no serde dependency).
+    fn to_json(&self) -> String {
         let ips = self
             .allowed_ips
             .iter()
@@ -41,7 +58,9 @@ impl VpnEndpoint {
         format!(
             "{{\"id\":\"{}\",\"name\":\"{}\",\"public_key\":\"{}\",\
              \"endpoint\":\"{}\",\"overlay_ipv4\":\"{}\",\"allowed_ips\":[{}],\
-             \"added_by\":\"{}\",\"added_at\":{},\"node_token\":\"{}\"}}",
+             \"added_by\":\"{}\",\"added_at\":{},\"organization_id\":\"{}\",\
+             \"workspace_id\":\"{}\",\"revoked_at\":{},\"token_rotated_at\":{},\
+             \"node_token\":\"{}\"}}",
             json_esc(&self.id),
             json_esc(&self.name),
             json_esc(&self.public_key),
@@ -50,6 +69,10 @@ impl VpnEndpoint {
             ips,
             json_esc(&self.added_by),
             self.added_at,
+            json_esc(&self.organization_id),
+            json_esc(&self.workspace_id),
+            self.revoked_at,
+            self.token_rotated_at,
             json_esc(&self.node_token),
         )
     }
@@ -195,6 +218,10 @@ fn parse_object(obj: &str) -> Option<VpnEndpoint> {
         allowed_ips: crate::auth::extract_json_str_array(obj, "allowed_ips"),
         added_by: crate::auth::extract_json_str(obj, "added_by").unwrap_or_default(),
         added_at: obj_u64(obj, "added_at"),
+        organization_id: crate::auth::extract_json_str(obj, "organization_id").unwrap_or_default(),
+        workspace_id: crate::auth::extract_json_str(obj, "workspace_id").unwrap_or_default(),
+        revoked_at: obj_u64(obj, "revoked_at"),
+        token_rotated_at: obj_u64(obj, "token_rotated_at"),
         // Default to "" for records written before node tokens existed —
         // AppState::new() backfills a fresh token and re-saves at startup.
         node_token: crate::auth::extract_json_str(obj, "node_token").unwrap_or_default(),

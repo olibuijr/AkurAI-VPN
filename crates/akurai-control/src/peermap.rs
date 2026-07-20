@@ -13,28 +13,21 @@ use crate::heartbeat::{self, Heartbeat};
 use crate::ipam;
 use crate::vpn_endpoint::VpnEndpoint;
 
-/// Build the JSON array of peers visible to `user_email`.
+/// Build the JSON array of peers visible to one organization/workspace.
 ///
-/// Scope rules:
-/// * only endpoints with `added_by == user_email` are included (per-user tenancy);
-/// * the caller's own node, named by `self_id`, is excluded — when `self_id` is
-///   `None`, nothing is excluded on that basis.
-///
-/// Each element is `{"overlay_ipv4","public_key","name","online","endpoint"}`.
-/// `online` is `true` when a fresh heartbeat exists for that node id (see
-/// [`heartbeat::is_online`]). `endpoint` is the fresh heartbeat endpoint when
-/// present, otherwise the endpoint saved on the enrolled device record. Hand-rolled
-/// JSON — no serde.
+/// Only active devices in the exact tenant boundary are included. The caller's
+/// own node, named by `self_id`, is excluded.
 pub fn build_peermap_json(
     endpoints: &[VpnEndpoint],
     heartbeats: &HashMap<String, Heartbeat>,
-    user_email: &str,
+    organization_id: &str,
+    workspace_id: &str,
     self_id: Option<&str>,
     now: u64,
 ) -> String {
     let peers = endpoints
         .iter()
-        .filter(|e| e.added_by == user_email)
+        .filter(|e| e.is_active() && e.belongs_to(organization_id, workspace_id))
         .filter(|e| self_id != Some(e.id.as_str()))
         .map(|e| peer_json(e, heartbeats, now))
         .collect::<Vec<_>>()
@@ -86,16 +79,17 @@ pub fn status() -> String {
 mod tests {
     use super::*;
 
-    fn ep(id: &str, added_by: &str, allowed: &[&str]) -> VpnEndpoint {
+    fn ep(id: &str, org_id: &str, ws_id: &str, allowed: &[&str]) -> VpnEndpoint {
         VpnEndpoint {
             id: id.to_string(),
             name: format!("name-{id}"),
             public_key: format!("pk-{id}"),
-            endpoint_addr: String::new(),
             allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
-            added_by: added_by.to_string(),
+            added_by: format!("{org_id}@example.com"),
             added_at: 1,
-            node_token: String::new(),
+            organization_id: org_id.to_string(),
+            workspace_id: ws_id.to_string(),
+            ..Default::default()
         }
     }
 
@@ -109,13 +103,13 @@ mod tests {
     #[test]
     fn peermap_is_scoped_to_the_user() {
         let endpoints = vec![
-            ep("mine", "user@example.com", &["100.88.0.2/32"]),
-            ep("theirs", "other@example.com", &["100.88.0.3/32"]),
+            ep("mine", "org-1", "ws-1", &["100.88.0.2/32"]),
+            ep("theirs", "org-2", "ws-2", &["100.88.0.3/32"]),
         ];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, 1_000);
         assert!(json.contains("name-mine"));
-        // Another user's node never appears in the caller's peer map.
+        // Another tenant's node never appears in the caller's peer map.
         assert!(!json.contains("name-theirs"));
         assert!(!json.contains("100.88.0.3"));
     }
@@ -123,11 +117,11 @@ mod tests {
     #[test]
     fn peermap_excludes_the_self_node() {
         let endpoints = vec![
-            ep("self", "user@example.com", &["100.88.0.2/32"]),
-            ep("peer", "user@example.com", &["100.88.0.3/32"]),
+            ep("self", "org-1", "ws-1", &["100.88.0.2/32"]),
+            ep("peer", "org-1", "ws-1", &["100.88.0.3/32"]),
         ];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", Some("self"), 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", Some("self"), 1_000);
         assert!(!json.contains("name-self"));
         assert!(!json.contains("100.88.0.2"));
         assert!(json.contains("name-peer"));
@@ -136,33 +130,33 @@ mod tests {
 
     #[test]
     fn peermap_no_self_param_excludes_nothing() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, 1_000);
         assert!(json.contains("name-a"));
     }
 
     #[test]
     fn online_is_false_without_a_heartbeat() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, 1_000);
         assert!(json.contains("\"online\":false"));
     }
 
     #[test]
     fn online_is_true_with_a_fresh_heartbeat() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let now = 1_000;
         let mut hbs = HashMap::new();
         hbs.insert("a".to_string(), fresh(now));
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, now);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, now);
         assert!(json.contains("\"online\":true"));
     }
 
     #[test]
     fn fresh_heartbeat_endpoint_is_included() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let now = 1_000;
         let mut hbs = HashMap::new();
         hbs.insert(
@@ -172,13 +166,13 @@ mod tests {
                 last_seen: now,
             },
         );
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, now);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, now);
         assert!(json.contains("\"endpoint\":\"192.168.1.44:51399\""));
     }
 
     #[test]
     fn stale_heartbeat_endpoint_is_not_included() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let mut hbs = HashMap::new();
         hbs.insert(
             "a".to_string(),
@@ -190,7 +184,8 @@ mod tests {
         let json = build_peermap_json(
             &endpoints,
             &hbs,
-            "user@example.com",
+            "org-1",
+            "ws-1",
             None,
             1_001 + heartbeat::HEARTBEAT_TTL_SECS,
         );
@@ -199,7 +194,7 @@ mod tests {
 
     #[test]
     fn online_flips_false_when_heartbeat_is_older_than_ttl() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.2/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.2/32"])];
         let last_seen = 1_000;
         let mut hbs = HashMap::new();
         hbs.insert(
@@ -211,24 +206,24 @@ mod tests {
         );
         // One second past the TTL window -> offline.
         let now = last_seen + heartbeat::HEARTBEAT_TTL_SECS + 1;
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, now);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, now);
         assert!(json.contains("\"online\":false"));
     }
 
     #[test]
     fn peer_json_carries_overlay_ipv4_and_public_key() {
-        let endpoints = vec![ep("a", "user@example.com", &["100.88.0.7/32"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["100.88.0.7/32"])];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, 1_000);
         assert!(json.contains("\"overlay_ipv4\":\"100.88.0.7\""));
         assert!(json.contains("\"public_key\":\"pk-a\""));
     }
 
     #[test]
     fn overlay_ipv4_is_empty_string_when_node_has_no_overlay_address() {
-        let endpoints = vec![ep("a", "user@example.com", &["0.0.0.0/0"])];
+        let endpoints = vec![ep("a", "org-1", "ws-1", &["0.0.0.0/0"])];
         let hbs = HashMap::new();
-        let json = build_peermap_json(&endpoints, &hbs, "user@example.com", None, 1_000);
+        let json = build_peermap_json(&endpoints, &hbs, "org-1", "ws-1", None, 1_000);
         assert!(json.contains("\"overlay_ipv4\":\"\""));
     }
 }
